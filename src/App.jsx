@@ -1,5 +1,6 @@
 import { useState, useCallback, useMemo, useRef, useEffect, useLayoutEffect } from "react";
-import * as XLSX from "xlsx";
+import readExcelFile from "read-excel-file/browser";
+import writeExcelFile from "write-excel-file/browser";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as RTooltip,
   ResponsiveContainer, AreaChart, Area, BarChart, Bar, Cell, ReferenceLine,
@@ -10,7 +11,8 @@ import { mkT, C8 } from "./theme.js";
 import { Logo, Ic } from "./icons.jsx";
 import {
   calcMetrics, buildSampleDataset, extractIV, computeEfficiency,
-  metricsToRows, rowsToCsv, siPrefix, fmtSI,
+  metricsToRows, rowsToCsv, siPrefix, fmtSI, parseCsv, buildAlignedRows,
+  rawDataToRows, metadataToRows,
 } from "./lib/ivAnalysis.js";
 import { getUserData, saveUserData } from "./persistence.js";
 import { ChartTip, Toggles, VLookup, RawDataViewer, TweenNumber } from "./components/shared.jsx";
@@ -21,6 +23,7 @@ import { AboutPage } from "./components/AboutPage.jsx";
 import { Welcome } from "./components/Welcome.jsx";
 
 const WELCOME_KEY = "siv_welcome_seen";
+const MAX_IMPORT_BYTES = 25 * 1024 * 1024;
 
 function download(blob, filename) {
   const url = URL.createObjectURL(blob);
@@ -52,6 +55,7 @@ export default function App() {
   // then auto-launches the guided tour.
   const [autoTourPending, setAutoTourPending] = useState(false);
   const [importError, setImportError] = useState("");
+  const [exportError, setExportError] = useState("");
   const [navPill, setNavPill] = useState(null); // {top, height} of the active nav item, in sidebar-local coords
   const fileRef = useRef(null);
   const navWrapRef = useRef(null);
@@ -67,7 +71,13 @@ export default function App() {
     if (session && !session.isGuest) {
       const ud = getUserData(session.id);
       if (ud.datasets && ud.datasets.length > 0) {
-        const restored = ud.datasets.map((d) => ({ name: d.name, conditions: d.conditions, ivData: d.ivData }));
+        const restored = ud.datasets.map((d) => ({
+          name: d.name,
+          conditions: d.conditions,
+          ivData: d.ivData,
+          diagnostics: d.diagnostics,
+          source: d.source,
+        }));
         if (restored.length > 0) setDatasets((prev) => prev.concat(restored));
       }
     }
@@ -86,7 +96,13 @@ export default function App() {
   useEffect(() => {
     if (session && !session.isGuest && datasets.length > 1) {
       const ud = getUserData(session.id);
-      ud.datasets = datasets.slice(1).map((d) => ({ name: d.name, conditions: d.conditions, ivData: d.ivData }));
+      ud.datasets = datasets.slice(1).map((d) => ({
+        name: d.name,
+        conditions: d.conditions,
+        ivData: d.ivData,
+        diagnostics: d.diagnostics,
+        source: d.source,
+      }));
       saveUserData(session.id, ud);
     }
   }, [datasets, session]);
@@ -103,6 +119,14 @@ export default function App() {
   }, [ds]);
 
   const activeConds = useMemo(() => (ds ? ds.conditions.filter((c) => selConds[c]) : []), [ds, selConds]);
+  const radarConds = useMemo(() => activeConds.filter((condition) => {
+    const metrics = allM[condition];
+    return metrics &&
+      metrics.quality !== "invalid" &&
+      ["measured", "interpolated"].includes(metrics.status?.pmax) &&
+      ["measured", "interpolated"].includes(metrics.status?.voc) &&
+      metrics.status?.ff === "computed";
+  }), [activeConds, allM]);
 
   // Auto-ranged SI display scales, picked from the dataset's largest current
   // and power magnitudes so µA-scale lab cells and A-scale production cells
@@ -121,14 +145,7 @@ export default function App() {
 
   // I-V chart: signed current (dataset scale) → curve correctly crosses zero at Voc.
   const ivChart = useMemo(() => {
-    if (!ds) return [];
-    const f = ds.ivData[ds.conditions[0]];
-    if (!f) return [];
-    return f.map((pt, i) => {
-      const row = { voltage: pt.voltage };
-      activeConds.forEach((c) => { const pts = ds.ivData[c]; if (pts && pts[i]) row[c] = pts[i].rawCurrent / scales.i.div; });
-      return row;
-    });
+    return buildAlignedRows(ds, activeConds, (point) => point.rawCurrent / scales.i.div);
   }, [ds, activeConds, scales]);
 
   // P-V chart: signed power (dataset scale). Deep reverse-bias power is
@@ -137,19 +154,20 @@ export default function App() {
   // The zero crossing at Voc plus a 20 % negative margin is kept visible.
   const pvChart = useMemo(() => {
     if (!ds) return [];
-    const f = ds.ivData[ds.conditions[0]];
-    if (!f) return [];
     let gmax = 0;
-    activeConds.forEach((c) => (ds.ivData[c] || []).forEach((pt) => { const p = pt.voltage * pt.rawCurrent; if (p > gmax) gmax = p; }));
+    activeConds.forEach((c) => (ds.ivData[c] || []).forEach((pt) => {
+      const p = (pt.voltage * pt.rawCurrent) / scales.p.div;
+      if (p > gmax) gmax = p;
+    }));
     const cutoff = -0.2 * gmax;
-    return f.map((pt, i) => {
-      const row = { voltage: pt.voltage };
-      activeConds.forEach((c) => {
-        const pts = ds.ivData[c];
-        if (pts && pts[i]) {
-          const p = pts[i].voltage * pts[i].rawCurrent;
-          row[c] = gmax > 0 && p < cutoff ? null : p / scales.p.div;
-        }
+    return buildAlignedRows(
+      ds,
+      activeConds,
+      (point) => (point.voltage * point.rawCurrent) / scales.p.div
+    ).map((sourceRow) => {
+      const row = { ...sourceRow };
+      activeConds.forEach((condition) => {
+        if (Number.isFinite(row[condition]) && gmax > 0 && row[condition] < cutoff) row[condition] = null;
       });
       return row;
     });
@@ -172,9 +190,11 @@ export default function App() {
   const qualityFlags = useMemo(() => {
     const out = [];
     if (!ds) return out;
+    (ds.diagnostics?.warnings || []).forEach((w) => out.push({ c: "IMPORT", w, severity: "warning" }));
     ds.conditions.forEach((c) => {
       const m = allM[c];
-      if (m && m.warnings) m.warnings.forEach((w) => out.push({ c, w }));
+      if (m && m.errors) m.errors.forEach((w) => out.push({ c, w, severity: "error" }));
+      if (m && m.warnings) m.warnings.forEach((w) => out.push({ c, w, severity: "warning" }));
     });
     return out;
   }, [ds, allM]);
@@ -188,14 +208,22 @@ export default function App() {
   const radarD = useMemo(() => {
     if (!ds || !Object.keys(allM).length) return [];
     const mx = { isc: 0, voc: 0, pmax: 0, ff: 0 };
-    ds.conditions.forEach((c) => { const m = allM[c]; if (m) ["isc", "voc", "pmax", "ff"].forEach((k) => { if (m[k] > mx[k]) mx[k] = m[k]; }); });
+    radarConds.forEach((c) => {
+      const m = allM[c];
+      if (m) ["isc", "voc", "pmax", "ff"].forEach((k) => {
+        if (Number.isFinite(m[k]) && m[k] > mx[k]) mx[k] = m[k];
+      });
+    });
     return ["Isc", "Voc", "Pmax", "FF"].map((label) => {
       const row = { metric: label };
       const k = label.toLowerCase();
-      ds.conditions.forEach((c) => { const m = allM[c]; if (m) row[c] = mx[k] > 0 ? (m[k] / mx[k]) * 100 : 0; });
+      radarConds.forEach((c) => {
+        const m = allM[c];
+        if (m) row[c] = mx[k] > 0 && Number.isFinite(m[k]) ? (m[k] / mx[k]) * 100 : 0;
+      });
       return row;
     });
-  }, [ds, allM]);
+  }, [ds, allM, radarConds]);
 
   const efficiency = useMemo(() => {
     if (!ds) return null;
@@ -203,7 +231,10 @@ export default function App() {
     let any = false;
     ds.conditions.forEach((c) => {
       const m = allM[c];
-      if (m) { const e = computeEfficiency(m.pmax, cellArea, irradiance); if (e != null) { r[c] = e; any = true; } }
+      if (m && m.quality !== "invalid" && ["measured", "interpolated"].includes(m.status?.pmax)) {
+        const e = computeEfficiency(m.pmax, cellArea, irradiance);
+        if (e != null) { r[c] = e; any = true; }
+      }
     });
     return any ? r : null;
   }, [cellArea, irradiance, ds, allM]);
@@ -234,39 +265,84 @@ export default function App() {
     setNavPill({ top: btnRect.top - wrapRect.top, height: btnRect.height });
   }, [page, sideOpen, nav]);
 
-  const handleFile = useCallback((f) => {
+  const handleFile = useCallback(async (f) => {
     if (!f) return;
     setImportError("");
-    f.arrayBuffer().then((buf) => {
-      const wb = XLSX.read(buf, { type: "array" });
+    if (f.size > MAX_IMPORT_BYTES) {
+      setImportError(`"${f.name}" is larger than the 25 MB safety limit. Split very large workbooks into one sweep group per file.`);
+      return;
+    }
+    const extension = f.name.toLowerCase().split(".").pop();
+    if (extension !== "xlsx" && extension !== "csv") {
+      setImportError(`Unsupported file type ".${extension || "unknown"}". Use .xlsx or .csv; legacy .xls is intentionally rejected.`);
+      return;
+    }
+    try {
       const sh = {};
-      wb.SheetNames.forEach((n) => { sh[n] = XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, defval: null }); });
+      if (extension === "csv") {
+        sh.CSV = parseCsv(await f.text());
+      } else {
+        const sheets = await readExcelFile(f);
+        sheets.forEach(({ sheet, data }) => { sh[sheet] = data; });
+      }
       const valid = Object.keys(sh).filter((s) => { const d = extractIV(sh[s]); return d && d.conditions.length > 0; });
       if (!valid.length) { setImportError("No valid I-V data found in \"" + f.name + "\". Solavin expects voltage (V) in column A and one current sweep (A) per following column, with a header row."); return; }
-      if (valid.length > 1) { setSheetPicker({ file: f, sheets: sh, valid }); return; }
+      if (valid.length > 1) { setSheetPicker({ fileName: f.name, sheets: sh, valid }); return; }
       doLoad(f.name, sh, valid[0]);
-    }).catch((e) => setImportError("Could not read \"" + f.name + "\": " + e.message));
+    } catch (e) {
+      setImportError("Could not read \"" + f.name + "\": " + e.message);
+    }
   }, [datasets.length]);
 
   function doLoad(fn, sh, sn) {
     const parsed = extractIV(sh[sn]);
     if (!parsed) return;
-    setDatasets((prev) => prev.concat([{ name: fn.replace(/\.xlsx?$/i, "") + (sn ? " (" + sn + ")" : ""), conditions: parsed.conditions, ivData: parsed.ivData }]));
+    setDatasets((prev) => prev.concat([{
+      name: fn.replace(/\.(xlsx|csv)$/i, "") + (sn ? " (" + sn + ")" : ""),
+      conditions: parsed.conditions,
+      ivData: parsed.ivData,
+      diagnostics: parsed.diagnostics,
+      source: { file: fn, sheet: sn },
+    }]));
     setActiveDs(datasets.length);
     setSheetPicker(null);
     setPage("home");
   }
 
   function doExportCSV() {
-    const csv = rowsToCsv(metricsToRows(ds, allM, efficiency));
-    download(new Blob([csv], { type: "text/csv" }), "solavin_iv_metrics.csv");
+    setExportError("");
+    try {
+      const efficiencyInputs = {
+        cellAreaCm2: String(cellArea).trim() === "" ? NaN : Number(cellArea),
+        irradianceWm2: String(irradiance).trim() === "" ? NaN : Number(irradiance),
+      };
+      const csv = rowsToCsv(metricsToRows(ds, allM, efficiency, efficiencyInputs));
+      download(new Blob(["\ufeff", csv], { type: "text/csv;charset=utf-8" }), "solavin_iv_metrics.csv");
+    } catch (error) {
+      setExportError("CSV export failed: " + error.message);
+    }
   }
-  function doExportXLSX() {
-    const rows = metricsToRows(ds, allM, efficiency);
-    const ws = XLSX.utils.aoa_to_sheet(rows);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Metrics");
-    XLSX.writeFile(wb, "solavin_iv_metrics.xlsx");
+  async function doExportXLSX() {
+    setExportError("");
+    try {
+      const efficiencyInputs = {
+        cellAreaCm2: String(cellArea).trim() === "" ? NaN : Number(cellArea),
+        irradianceWm2: String(irradiance).trim() === "" ? NaN : Number(irradiance),
+      };
+      const toSheetData = (rows) => rows.map((row, rowIndex) => row.map((value) => ({
+        value,
+        type: typeof value === "number" ? Number : String,
+        fontWeight: rowIndex === 0 ? "bold" : undefined,
+        backgroundColor: rowIndex === 0 ? "#E8F5F0" : undefined,
+      })));
+      await writeExcelFile([
+        { sheet: "Metrics", data: toSheetData(metricsToRows(ds, allM, efficiency, efficiencyInputs)) },
+        { sheet: "Raw Data", data: toSheetData(rawDataToRows(ds)) },
+        { sheet: "Metadata", data: toSheetData(metadataToRows(ds, efficiencyInputs)) },
+      ]).toFile("solavin_iv_analysis.xlsx");
+    } catch (error) {
+      setExportError("XLSX export failed: " + error.message);
+    }
   }
 
   function dismissTour() {
@@ -304,11 +380,11 @@ export default function App() {
             <Logo s={sideOpen ? 32 : 26} />
             {sideOpen && <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontWeight: 700, fontSize: 12, letterSpacing: "-.01em" }}>Solavin</div>
-              <div className="mono" style={{ fontSize: 8, color: t.textD, letterSpacing: ".18em", marginTop: 1 }}>v3.1.0</div>
+              <div className="mono" style={{ fontSize: 8, color: t.textD, letterSpacing: ".18em", marginTop: 1 }}>v4.0.0</div>
             </div>}
           </div>
           {sideOpen && <div className="mono" style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10, padding: "5px 8px", borderRadius: 6, background: t.inputBg, border: "1px solid " + t.border, fontSize: 9, color: t.textM, letterSpacing: ".06em" }}>
-            <span className="statusdot" /><span style={{ color: t.success, fontWeight: 600 }}>ONLINE</span><span style={{ marginLeft: "auto", color: t.textD }}>SMU-2400</span>
+            <span className="statusdot" /><span style={{ color: t.success, fontWeight: 600 }}>LOCAL</span><span style={{ marginLeft: "auto", color: t.textD }}>NO BACKEND</span>
           </div>}
         </div>
         {sideOpen && <div className="mono" style={{ padding: "10px 14px 4px", fontSize: 8, color: t.textD, letterSpacing: ".18em", fontWeight: 600 }}>NAVIGATION</div>}
@@ -329,7 +405,7 @@ export default function App() {
         <div style={{ padding: "6px 6px 4px", borderTop: "1px solid " + t.border }}>
           {/* Filled gradient treatment so the assistant reads as a primary
               feature in the rail, not a muted afterthought. */}
-          <button onClick={() => setChatOpen(!chatOpen)} className="press" style={{ display: "flex", alignItems: "center", gap: 9, width: "100%", padding: sideOpen ? "10px 12px" : "10px 0", borderRadius: 8, border: "none", background: "linear-gradient(135deg," + t.accent + "," + t.accent2 + ")", color: "#fff", fontSize: 11.5, fontWeight: 700, justifyContent: sideOpen ? "flex-start" : "center", boxShadow: chatOpen ? "0 0 0 1px " + t.accent + "55 inset" : "0 4px 16px " + t.accentG }}><Ic.Bot s={16} c="#fff" />{sideOpen && <span>Lab Assistant</span>}{sideOpen && <span className="mono" style={{ marginLeft: "auto", fontSize: 7.5, fontWeight: 700, letterSpacing: ".12em", padding: "2px 6px", borderRadius: 4, background: "rgba(255,255,255,.18)", color: "#fff" }}>AI</span>}</button>
+          <button onClick={() => setChatOpen(!chatOpen)} className="press" style={{ display: "flex", alignItems: "center", gap: 9, width: "100%", padding: sideOpen ? "10px 12px" : "10px 0", borderRadius: 8, border: "none", background: "linear-gradient(135deg," + t.accent + "," + t.accent2 + ")", color: "#fff", fontSize: 11.5, fontWeight: 700, justifyContent: sideOpen ? "flex-start" : "center", boxShadow: chatOpen ? "0 0 0 1px " + t.accent + "55 inset" : "0 4px 16px " + t.accentG }}><Ic.Bot s={16} c="#fff" />{sideOpen && <span>Lab Assistant</span>}{sideOpen && <span className="mono" style={{ marginLeft: "auto", fontSize: 7.5, fontWeight: 700, letterSpacing: ".12em", padding: "2px 6px", borderRadius: 4, background: "rgba(255,255,255,.18)", color: "#fff" }}>LOCAL</span>}</button>
         </div>
         <button onClick={() => setSideOpen(!sideOpen)} className="mono" style={{ borderTop: "1px solid " + t.border, background: "none", border: "none", padding: "9px 10px", color: t.textD, display: "flex", alignItems: "center", justifyContent: sideOpen ? "space-between" : "center", gap: 5, fontSize: 9, width: "100%", letterSpacing: ".1em" }}>{sideOpen && <span>COLLAPSE</span>}<Ic.Chv s={12} st={{ transform: sideOpen ? "rotate(180deg)" : "none", transition: "transform .3s" }} /></button>
       </nav>
@@ -374,28 +450,43 @@ export default function App() {
               <div>
                 <div className="mono" style={{ fontSize: 9, color: t.textD, letterSpacing: ".18em", fontWeight: 600, marginBottom: 6 }}>SESSION ▸ {new Date().toISOString().slice(0, 10)}</div>
                 <h2 style={{ fontSize: 26, fontWeight: 700, letterSpacing: "-.03em", marginBottom: 5, lineHeight: 1.1 }}><span style={{ background: t.grad, WebkitBackgroundClip: "text", backgroundClip: "text", WebkitTextFillColor: "transparent", color: "transparent" }}>Measurement Dashboard</span></h2>
-                <p style={{ fontSize: 12, color: t.textM }}>{ds.name} · {ds.conditions.length} conditions · {(ds.ivData[ds.conditions[0]] || []).length} sweep points per channel</p>
+                <p style={{ fontSize: 12, color: t.textM }}>{ds.name} · {ds.conditions.length} conditions · {Math.min(...ds.conditions.map((c) => (ds.ivData[c] || []).length))}–{Math.max(...ds.conditions.map((c) => (ds.ivData[c] || []).length))} valid points/channel</p>
               </div>
               <div className="mono" style={{ display: "flex", gap: 8, fontSize: 9, color: t.textM, letterSpacing: ".06em" }}>
-                <div style={{ padding: "6px 12px", borderRadius: 6, background: t.card, border: "1px solid " + t.border }}><div style={{ color: t.textD, fontSize: 8 }}>METHOD</div><div style={{ color: t.text, fontWeight: 600, marginTop: 2 }}>4-WIRE KELVIN</div></div>
-                <div title={qualityFlags.length ? qualityFlags.map((f) => f.c + ": " + f.w).join("\n") : "All channels passed automated sanity checks"} style={{ padding: "6px 12px", borderRadius: 6, background: t.card, border: "1px solid " + t.border, cursor: qualityFlags.length ? "help" : "default" }}><div style={{ color: t.textD, fontSize: 8 }}>DATA QUALITY</div><div style={{ color: qualityFlags.length ? t.warn : t.success, fontWeight: 600, marginTop: 2, display: "flex", alignItems: "center", gap: 4 }}>{qualityFlags.length ? "⚠ " + qualityFlags.length + " FLAG" + (qualityFlags.length > 1 ? "S" : "") : <><span className="statusdot" />CLEAN</>}</div></div>
+                <div style={{ padding: "6px 12px", borderRadius: 6, background: t.card, border: "1px solid " + t.border }}><div style={{ color: t.textD, fontSize: 8 }}>CONVENTION</div><div style={{ color: t.text, fontWeight: 600, marginTop: 2 }}>GENERATOR · SIGNED I</div></div>
+                <div title={qualityFlags.length ? qualityFlags.map((f) => f.c + ": " + f.w).join("\n") : "All automated checks passed"} style={{ padding: "6px 12px", borderRadius: 6, background: t.card, border: "1px solid " + t.border, cursor: qualityFlags.length ? "help" : "default" }}><div style={{ color: t.textD, fontSize: 8 }}>AUTOMATED CHECKS</div><div style={{ color: qualityFlags.some((f) => f.severity === "error") ? t.danger : qualityFlags.length ? t.warn : t.success, fontWeight: 600, marginTop: 2, display: "flex", alignItems: "center", gap: 4 }}>{qualityFlags.length ? "⚠ " + qualityFlags.length + " FLAG" + (qualityFlags.length > 1 ? "S" : "") : <><span className="statusdot" />PASSED</>}</div></div>
               </div>
             </div>
 
             {/* Best-of stat cards */}
             <div data-tour="stats" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(180px,1fr))", gap: 10, marginBottom: 18 }}>
               {(() => {
-                const vals = Object.values(allM).filter(Boolean);
-                const bp = Math.max(0, ...vals.map((m) => m.pmax));
-                const bi = Math.max(0, ...vals.map((m) => m.isc));
-                const bv = Math.max(0, ...vals.map((m) => m.voc));
-                const bf = Math.max(0, ...vals.map((m) => m.ff));
-                const bestOf = (key) => { let bc = "", bw = -Infinity; ds.conditions.forEach((c) => { const m = allM[c]; if (m && m[key] > bw) { bw = m[key]; bc = c; } }); return bc; };
+                const eligible = (m, key) => {
+                  if (!m || m.quality === "invalid" || !Number.isFinite(m[key])) return false;
+                  if (key === "voc") return m.status?.voc === "measured" || m.status?.voc === "interpolated";
+                  if (key === "pmax") return m.status?.pmax === "measured" || m.status?.pmax === "interpolated";
+                  if (key === "ff") return m.status?.ff === "computed";
+                  return true;
+                };
+                const bestOf = (key) => {
+                  let best = null;
+                  ds.conditions.forEach((condition) => {
+                    const metrics = allM[condition];
+                    if (eligible(metrics, key) && (!best || metrics[key] > best.value)) {
+                      best = { condition, value: metrics[key] };
+                    }
+                  });
+                  return best;
+                };
+                const bp = bestOf("pmax");
+                const bi = bestOf("isc");
+                const bv = bestOf("voc");
+                const bf = bestOf("ff");
                 return [
-                  { l: "P_max", sub: "Maximum power", v: bp / scales.p.div, d: 3, unit: pU, c: dark ? "#fbbf24" : "#b45309", IC: Ic.Up, best: bestOf("pmax") },
-                  { l: "I_sc", sub: "Short-circuit current", v: bi / scales.i.div, d: 3, unit: iU, c: dark ? "#22d3ee" : "#0891b2", IC: Ic.Act, best: bestOf("isc") },
-                  { l: "V_oc", sub: "Open-circuit voltage", v: bv, d: 3, unit: "V", c: dark ? "#38bdf8" : "#0284c7", IC: Ic.Target, best: bestOf("voc") },
-                  { l: "FF", sub: "Fill factor", v: bf * 100, d: 1, unit: "%", c: dark ? "#a78bfa" : "#7c3aed", IC: Ic.Rad, best: bestOf("ff") },
+                  { l: "P_max", sub: "Maximum power", v: bp ? bp.value / scales.p.div : NaN, d: 3, unit: pU, c: dark ? "#fbbf24" : "#b45309", IC: Ic.Up, best: bp?.condition },
+                  { l: "I_sc", sub: "Short-circuit current", v: bi ? bi.value / scales.i.div : NaN, d: 3, unit: iU, c: dark ? "#22d3ee" : "#0891b2", IC: Ic.Act, best: bi?.condition },
+                  { l: "V_oc", sub: "Open-circuit voltage", v: bv ? bv.value : NaN, d: 3, unit: "V", c: dark ? "#38bdf8" : "#0284c7", IC: Ic.Target, best: bv?.condition },
+                  { l: "FF", sub: "Fill factor", v: bf ? bf.value * 100 : NaN, d: 1, unit: "%", c: dark ? "#a78bfa" : "#7c3aed", IC: Ic.Rad, best: bf?.condition },
                 ].map((s, i) => (
                   <div key={s.l} className="card-glow lift corners" style={{ background: "linear-gradient(180deg," + t.card + "," + t.cardAlt + ")", borderRadius: 10, border: "1px solid " + t.border, padding: "14px 16px", position: "relative", overflow: "hidden", animation: "slideup .4s cubic-bezier(.4,0,.2,1) " + i * 0.06 + "s both" }}>
                     <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 1, background: "linear-gradient(90deg,transparent," + s.c + "66 30%," + s.c + " 50%," + s.c + "66 70%,transparent)", opacity: 0.6 }} />
@@ -411,7 +502,7 @@ export default function App() {
                       <span className="mono" style={{ fontSize: 11, color: s.c, fontWeight: 700 }}>{s.unit}</span>
                     </div>
                     <div className="mono" style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid " + t.border, fontSize: 9, color: t.textD, display: "flex", alignItems: "center", gap: 5 }}>
-                      <span style={{ width: 5, height: 5, borderRadius: 3, background: s.c }} /><span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.best}</span>
+                      <span style={{ width: 5, height: 5, borderRadius: 3, background: s.c }} /><span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.best || "No valid channel"}</span>
                     </div>
                   </div>
                 ));
@@ -434,8 +525,8 @@ export default function App() {
                 <YAxis tick={{ fill: t.textM, fontSize: 9 }} stroke={t.borderS} label={{ value: "CURRENT (" + iU + ")", angle: -90, position: "insideLeft", offset: 0, fill: t.textD, fontSize: 8, letterSpacing: "0.18em", style: { textAnchor: "middle" } }} />
                 <RTooltip content={<ChartTip unit={iU} t={t} />} />
                 <ReferenceLine y={0} stroke={t.textD} strokeDasharray="3 3" strokeOpacity={0.5} />
-                {ds.conditions.slice(0, 4).map((c, ci) => <Line key={c} type="monotone" dataKey={c} stroke={C8[ci % C8.length]} strokeWidth={1.6} dot={false} isAnimationActive={animate} animationDuration={900} animationEasing="ease-out" />)}
-                {ds.conditions.slice(0, 4).map((c, ci) => { const m = allM[c]; if (!m) return null; return <ReferenceDot key={"m" + c} x={m.vmp} y={m.imp / scales.i.div} r={3.5} fill={C8[ci % C8.length]} stroke="#fff" strokeWidth={1.5} />; })}
+                {ds.conditions.slice(0, 4).map((c, ci) => <Line key={c} type="linear" dataKey={c} connectNulls stroke={C8[ci % C8.length]} strokeWidth={1.6} dot={false} isAnimationActive={animate} animationDuration={900} animationEasing="ease-out" />)}
+                {ds.conditions.slice(0, 4).map((c, ci) => { const m = allM[c]; if (!m || !["measured", "interpolated", "provisional"].includes(m.status?.pmax)) return null; return <ReferenceDot key={"m" + c} x={m.vmp} y={m.imp / scales.i.div} r={3.5} fill={C8[ci % C8.length]} stroke="#fff" strokeWidth={1.5} />; })}
               </LineChart></ResponsiveContainer>
             </div>
 
@@ -475,12 +566,12 @@ export default function App() {
                 <YAxis tick={{ fill: t.textM, fontSize: 9 }} label={{ value: "CURRENT (" + iU + ")", angle: -90, position: "insideLeft", offset: 0, fill: t.textD, fontSize: 8, letterSpacing: "0.18em", style: { textAnchor: "middle" } }} stroke={t.borderS} />
                 <RTooltip content={<ChartTip unit={iU} t={t} />} />
                 <ReferenceLine y={0} stroke={t.textD} strokeDasharray="3 3" strokeOpacity={0.5} />
-                {activeConds.map((c) => <Line key={c} type="monotone" dataKey={c} stroke={C8[ds.conditions.indexOf(c) % C8.length]} strokeWidth={1.6} dot={false} activeDot={{ r: 5, strokeWidth: 2, stroke: "#fff" }} isAnimationActive={animate} animationDuration={900} animationEasing="ease-out" />)}
+                {activeConds.map((c) => <Line key={c} type="linear" dataKey={c} connectNulls stroke={C8[ds.conditions.indexOf(c) % C8.length]} strokeWidth={1.6} dot={false} activeDot={{ r: 5, strokeWidth: 2, stroke: "#fff" }} isAnimationActive={animate} animationDuration={900} animationEasing="ease-out" />)}
                 {activeConds.map((c) => { const m = allM[c]; if (!m) return null; return <ReferenceLine key={"vmp" + c} x={m.vmp} stroke={C8[ds.conditions.indexOf(c) % C8.length]} strokeDasharray="3 3" strokeOpacity={0.4} />; })}
                 {/* Annotated extraction markers: MPP on the curve, Voc at I=0, Isc at V=0 */}
-                {activeConds.map((c) => { const m = allM[c]; if (!m) return null; const col = C8[ds.conditions.indexOf(c) % C8.length]; return <ReferenceDot key={"mpp" + c} x={m.vmp} y={m.imp / scales.i.div} r={4} fill={col} stroke="#fff" strokeWidth={1.5} ifOverflow="discard" label={activeConds.length <= 3 ? { value: "MPP", position: "top", fill: col, fontSize: 8, fontWeight: 700 } : undefined} />; })}
-                {activeConds.map((c) => { const m = allM[c]; if (!m || m.notes.vocBeyondRange) return null; const col = C8[ds.conditions.indexOf(c) % C8.length]; return <ReferenceDot key={"voc" + c} x={m.voc} y={0} r={3} fill={t.card} stroke={col} strokeWidth={1.5} ifOverflow="discard" label={activeConds.length <= 3 ? { value: "Voc", position: "bottom", fill: t.textM, fontSize: 8 } : undefined} />; })}
-                {activeConds.map((c) => { const m = allM[c]; if (!m) return null; const col = C8[ds.conditions.indexOf(c) % C8.length]; return <ReferenceDot key={"isc" + c} x={0} y={m.isc / scales.i.div} r={3} fill={t.card} stroke={col} strokeWidth={1.5} ifOverflow="discard" label={activeConds.length <= 3 ? { value: "Isc", position: "left", fill: t.textM, fontSize: 8 } : undefined} />; })}
+                {activeConds.map((c) => { const m = allM[c]; if (!m || !["measured", "interpolated", "provisional"].includes(m.status?.pmax)) return null; const col = C8[ds.conditions.indexOf(c) % C8.length]; return <ReferenceDot key={"mpp" + c} x={m.vmp} y={m.imp / scales.i.div} r={4} fill={col} stroke="#fff" strokeWidth={1.5} ifOverflow="discard" label={activeConds.length <= 3 ? { value: "MPP", position: "top", fill: col, fontSize: 8, fontWeight: 700 } : undefined} />; })}
+                {activeConds.map((c) => { const m = allM[c]; if (!m || m.voc == null || m.notes.vocBeyondRange) return null; const col = C8[ds.conditions.indexOf(c) % C8.length]; return <ReferenceDot key={"voc" + c} x={m.voc} y={0} r={3} fill={t.card} stroke={col} strokeWidth={1.5} ifOverflow="discard" label={activeConds.length <= 3 ? { value: "Voc", position: "bottom", fill: t.textM, fontSize: 8 } : undefined} />; })}
+                {activeConds.map((c) => { const m = allM[c]; if (!m || !Number.isFinite(m.isc)) return null; const col = C8[ds.conditions.indexOf(c) % C8.length]; return <ReferenceDot key={"isc" + c} x={0} y={m.isc / scales.i.div} r={3} fill={t.card} stroke={col} strokeWidth={1.5} ifOverflow="discard" label={activeConds.length <= 3 ? { value: "Isc", position: "left", fill: t.textM, fontSize: 8 } : undefined} />; })}
                 {lookupV != null && <ReferenceLine x={lookupV} stroke={t.warn} strokeWidth={1.5} strokeDasharray="6 3" label={{ value: "V = " + lookupV.toFixed(3), fill: t.warn, fontSize: 9, position: "top" }} />}
                 <Brush dataKey="voltage" height={24} stroke={t.accent} fill={t.cardAlt} travellerWidth={8} />
               </LineChart></ResponsiveContainer>
@@ -496,8 +587,8 @@ export default function App() {
                 <defs>{C8.map((col, i) => <linearGradient key={i} id={"pvg" + i} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={col} stopOpacity={0.12} /><stop offset="100%" stopColor={col} stopOpacity={0} /></linearGradient>)}</defs>
                 <CartesianGrid strokeDasharray="2 4" stroke={t.border} strokeOpacity={0.5} /><XAxis dataKey="voltage" type="number" tick={{ fill: t.textM, fontSize: 9 }} label={{ value: "VOLTAGE (V)", position: "bottom", offset: 6, fill: t.textD, fontSize: 8, letterSpacing: "0.18em" }} stroke={t.borderS} /><YAxis domain={pvDomain} allowDataOverflow tickFormatter={(v) => +Number(v).toFixed(2)} tick={{ fill: t.textM, fontSize: 9 }} label={{ value: "POWER (" + pU + ")", angle: -90, position: "insideLeft", offset: 0, fill: t.textD, fontSize: 8, letterSpacing: "0.18em", style: { textAnchor: "middle" } }} stroke={t.borderS} /><RTooltip content={<ChartTip unit={pU} t={t} />} />
                 <ReferenceLine y={0} stroke={t.textD} strokeDasharray="3 3" strokeOpacity={0.5} />
-                {activeConds.map((c) => { const ci = ds.conditions.indexOf(c); const col = C8[ci % C8.length]; return <Area key={c} type="monotone" dataKey={c} stroke={col} fill={"url(#pvg" + ci + ")"} strokeWidth={1.6} dot={false} activeDot={{ r: 5, strokeWidth: 2, stroke: "#fff" }} isAnimationActive={animate} animationDuration={900} animationEasing="ease-out" />; })}
-                {activeConds.map((c) => { const m = allM[c]; if (!m) return null; return <ReferenceDot key={"p" + c} x={m.vmp} y={m.pmax / scales.p.div} r={5} fill={C8[ds.conditions.indexOf(c) % C8.length]} stroke="#fff" strokeWidth={2} ifOverflow="discard" label={activeConds.length <= 3 ? { value: "Pmax", position: "top", fill: C8[ds.conditions.indexOf(c) % C8.length], fontSize: 8, fontWeight: 700 } : undefined} />; })}
+                {activeConds.map((c) => { const ci = ds.conditions.indexOf(c); const col = C8[ci % C8.length]; return <Area key={c} type="linear" dataKey={c} connectNulls stroke={col} fill={"url(#pvg" + ci + ")"} strokeWidth={1.6} dot={false} activeDot={{ r: 5, strokeWidth: 2, stroke: "#fff" }} isAnimationActive={animate} animationDuration={900} animationEasing="ease-out" />; })}
+                {activeConds.map((c) => { const m = allM[c]; if (!m || !["measured", "interpolated", "provisional"].includes(m.status?.pmax)) return null; return <ReferenceDot key={"p" + c} x={m.vmp} y={m.pmax / scales.p.div} r={5} fill={C8[ds.conditions.indexOf(c) % C8.length]} stroke="#fff" strokeWidth={2} ifOverflow="discard" label={activeConds.length <= 3 ? { value: "Pmax", position: "top", fill: C8[ds.conditions.indexOf(c) % C8.length], fontSize: 8, fontWeight: 700 } : undefined} />; })}
                 {lookupV != null && <ReferenceLine x={lookupV} stroke={t.warn} strokeWidth={1.5} strokeDasharray="6 3" />}
               </AreaChart></ResponsiveContainer></div>}
 
@@ -515,8 +606,8 @@ export default function App() {
                 <YAxis tick={{ fill: t.textM, fontSize: 9 }} label={{ value: "I (" + iU + ")", angle: -90, position: "insideLeft", offset: 8, fill: t.textD, fontSize: 8, letterSpacing: "0.14em", style: { textAnchor: "middle" } }} stroke={t.borderS} />
                 <RTooltip content={<ChartTip unit={iU} t={t} />} />
                 <ReferenceLine y={0} stroke={t.textD} strokeDasharray="3 3" strokeOpacity={0.5} />
-                {activeConds.map((c) => <Line key={c} type="monotone" dataKey={c} stroke={C8[ds.conditions.indexOf(c) % C8.length]} strokeWidth={1.6} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: "#fff" }} isAnimationActive={animate} animationDuration={700} animationEasing="ease-out" />)}
-                {activeConds.map((c) => { const m = allM[c]; if (!m) return null; return <ReferenceDot key={"mpp" + c} x={m.vmp} y={m.imp / scales.i.div} r={3.5} fill={C8[ds.conditions.indexOf(c) % C8.length]} stroke="#fff" strokeWidth={1.5} ifOverflow="discard" />; })}
+                {activeConds.map((c) => <Line key={c} type="linear" dataKey={c} connectNulls stroke={C8[ds.conditions.indexOf(c) % C8.length]} strokeWidth={1.6} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: "#fff" }} isAnimationActive={animate} animationDuration={700} animationEasing="ease-out" />)}
+                {activeConds.map((c) => { const m = allM[c]; if (!m || !["measured", "interpolated", "provisional"].includes(m.status?.pmax)) return null; return <ReferenceDot key={"mpp" + c} x={m.vmp} y={m.imp / scales.i.div} r={3.5} fill={C8[ds.conditions.indexOf(c) % C8.length]} stroke="#fff" strokeWidth={1.5} ifOverflow="discard" />; })}
               </LineChart></ResponsiveContainer>
               <ResponsiveContainer width="100%" height={250}><AreaChart data={pvChart} syncId="sweep" margin={{ top: 6, right: 24, bottom: 24, left: 42 }}>
                 <defs>{C8.map((col, i) => <linearGradient key={i} id={"dvg" + i} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={col} stopOpacity={0.12} /><stop offset="100%" stopColor={col} stopOpacity={0} /></linearGradient>)}</defs>
@@ -525,8 +616,8 @@ export default function App() {
                 <YAxis domain={pvDomain} allowDataOverflow tickFormatter={(v) => +Number(v).toFixed(2)} tick={{ fill: t.textM, fontSize: 9 }} label={{ value: "P (" + pU + ")", angle: -90, position: "insideLeft", offset: 8, fill: t.textD, fontSize: 8, letterSpacing: "0.14em", style: { textAnchor: "middle" } }} stroke={t.borderS} />
                 <RTooltip content={<ChartTip unit={pU} t={t} />} />
                 <ReferenceLine y={0} stroke={t.textD} strokeDasharray="3 3" strokeOpacity={0.5} />
-                {activeConds.map((c) => { const ci = ds.conditions.indexOf(c); const col = C8[ci % C8.length]; return <Area key={c} type="monotone" dataKey={c} stroke={col} fill={"url(#dvg" + ci + ")"} strokeWidth={1.6} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: "#fff" }} isAnimationActive={animate} animationDuration={700} animationEasing="ease-out" />; })}
-                {activeConds.map((c) => { const m = allM[c]; if (!m) return null; return <ReferenceDot key={"p" + c} x={m.vmp} y={m.pmax / scales.p.div} r={4} fill={C8[ds.conditions.indexOf(c) % C8.length]} stroke="#fff" strokeWidth={1.5} ifOverflow="discard" />; })}
+                {activeConds.map((c) => { const ci = ds.conditions.indexOf(c); const col = C8[ci % C8.length]; return <Area key={c} type="linear" dataKey={c} connectNulls stroke={col} fill={"url(#dvg" + ci + ")"} strokeWidth={1.6} dot={false} activeDot={{ r: 4, strokeWidth: 2, stroke: "#fff" }} isAnimationActive={animate} animationDuration={700} animationEasing="ease-out" />; })}
+                {activeConds.map((c) => { const m = allM[c]; if (!m || !["measured", "interpolated", "provisional"].includes(m.status?.pmax)) return null; return <ReferenceDot key={"p" + c} x={m.vmp} y={m.pmax / scales.p.div} r={4} fill={C8[ds.conditions.indexOf(c) % C8.length]} stroke="#fff" strokeWidth={1.5} ifOverflow="discard" />; })}
               </AreaChart></ResponsiveContainer>
             </div>}
 
@@ -534,19 +625,26 @@ export default function App() {
               <div className="scanline" />
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}><Ic.Rad s={13} c={t.accent} /><span style={{ fontWeight: 700, fontSize: 12 }}>Performance Profile</span><span className="mono" style={{ padding: "2px 7px", borderRadius: 4, background: t.accentS, border: "1px solid " + t.accent + "33", fontSize: 8, color: t.accent, fontWeight: 600, letterSpacing: ".1em" }}>NORMALIZED</span></div>
-                <div className="mono" style={{ fontSize: 9, color: t.textD, letterSpacing: ".06em" }}>0 → 100% RELATIVE</div>
+                <div className="mono" style={{ fontSize: 9, color: t.textD, letterSpacing: ".06em" }}>{radarConds.length} COMPLETE CHANNEL{radarConds.length === 1 ? "" : "S"} · 0 → 100% RELATIVE</div>
               </div>
-              <ResponsiveContainer width="100%" height={400}><RadarChart data={radarD}><PolarGrid stroke={t.border} strokeOpacity={0.4} /><PolarAngleAxis dataKey="metric" tick={{ fill: t.textM, fontSize: 11, fontWeight: 600 }} /><PolarRadiusAxis angle={30} domain={[0, 100]} tick={{ fill: t.textD, fontSize: 8 }} /><RTooltip contentStyle={{ background: t.card, border: "1px solid " + t.border, borderRadius: 8, fontSize: 10 }} itemStyle={{ color: t.text, fontWeight: 600 }} labelStyle={{ color: t.textM, fontWeight: 600 }} />{ds.conditions.map((c, ci) => <Radar key={c} name={c} dataKey={c} stroke={C8[ci % C8.length]} fill={C8[ci % C8.length]} fillOpacity={0.08} strokeWidth={1.5} animationDuration={1000} />)}</RadarChart></ResponsiveContainer></div>}
+              {radarConds.length > 0
+                ? <ResponsiveContainer width="100%" height={400}><RadarChart data={radarD}><PolarGrid stroke={t.border} strokeOpacity={0.4} /><PolarAngleAxis dataKey="metric" tick={{ fill: t.textM, fontSize: 11, fontWeight: 600 }} /><PolarRadiusAxis angle={30} domain={[0, 100]} tick={{ fill: t.textD, fontSize: 8 }} /><RTooltip contentStyle={{ background: t.card, border: "1px solid " + t.border, borderRadius: 8, fontSize: 10 }} itemStyle={{ color: t.text, fontWeight: 600 }} labelStyle={{ color: t.textM, fontWeight: 600 }} />{radarConds.map((c) => { const ci = ds.conditions.indexOf(c); return <Radar key={c} name={c} dataKey={c} stroke={C8[ci % C8.length]} fill={C8[ci % C8.length]} fillOpacity={0.08} strokeWidth={1.5} animationDuration={1000} />; })}</RadarChart></ResponsiveContainer>
+                : <div style={{ height: 400, display: "flex", alignItems: "center", justifyContent: "center", color: t.textM, fontSize: 11, textAlign: "center", padding: 24 }}>No active channel has complete reportable Isc, Voc, Pmax, and FF values.<br />Review sweep coverage and data-quality flags.</div>}
+            </div>}
 
             {vizTab === "compare" && (() => {
-              const bd = activeConds.map((c) => { const m = allM[c]; if (!m) return null; return { name: c, Pmax: m.pmax * 1e9, color: C8[ds.conditions.indexOf(c) % C8.length] }; }).filter(Boolean).sort((a, b) => b.Pmax - a.Pmax);
+              const bd = activeConds.map((c) => {
+                const m = allM[c];
+                if (!m || m.quality === "invalid" || !["measured", "interpolated"].includes(m.status?.pmax)) return null;
+                return { name: c, Pmax: m.pmax / scales.p.div, color: C8[ds.conditions.indexOf(c) % C8.length] };
+              }).filter(Boolean).sort((a, b) => b.Pmax - a.Pmax);
               return <div className="corners viewfade" style={{ background: "linear-gradient(180deg," + t.card + "," + t.cardAlt + ")", borderRadius: 10, border: "1px solid " + t.border, padding: "16px 14px 8px 0", position: "relative", overflow: "hidden" }}>
                 <div className="scanline" />
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", paddingLeft: 18, marginBottom: 8 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}><Ic.Bar3 s={13} c={t.accent} /><span style={{ fontWeight: 700, fontSize: 12 }}>P_max Comparison</span></div>
-                  <div className="mono" style={{ fontSize: 9, color: t.textD, letterSpacing: ".06em" }}>RANKED · DESC</div>
+                  <div className="mono" style={{ fontSize: 9, color: t.textD, letterSpacing: ".06em" }}>VALID CHANNELS · DESC</div>
                 </div>
-                <ResponsiveContainer width="100%" height={320}><BarChart data={bd} margin={{ top: 14, right: 24, bottom: 36, left: 30 }}><CartesianGrid strokeDasharray="2 4" stroke={t.border} strokeOpacity={0.5} /><XAxis dataKey="name" tick={{ fill: t.textM, fontSize: 9 }} angle={-14} textAnchor="end" stroke={t.borderS} /><YAxis tick={{ fill: t.textM, fontSize: 9 }} label={{ value: "PMAX (nW)", angle: -90, position: "insideLeft", offset: 0, fill: t.textD, fontSize: 8, letterSpacing: "0.18em", style: { textAnchor: "middle" } }} stroke={t.borderS} /><RTooltip cursor={{ fill: t.accent, fillOpacity: 0.08 }} contentStyle={{ background: t.card, border: "1px solid " + t.border, borderRadius: 8, fontSize: 10 }} itemStyle={{ color: t.text, fontWeight: 600 }} labelStyle={{ color: t.textM, fontWeight: 600 }} /><Bar dataKey="Pmax" name="Pmax (nW)" radius={[6, 6, 0, 0]} animationDuration={900} animationEasing="ease-out">{bd.map((e, i) => <Cell key={i} fill={e.color} />)}</Bar></BarChart></ResponsiveContainer>
+                <ResponsiveContainer width="100%" height={320}><BarChart data={bd} margin={{ top: 14, right: 24, bottom: 36, left: 30 }}><CartesianGrid strokeDasharray="2 4" stroke={t.border} strokeOpacity={0.5} /><XAxis dataKey="name" tick={{ fill: t.textM, fontSize: 9 }} angle={-14} textAnchor="end" stroke={t.borderS} /><YAxis tick={{ fill: t.textM, fontSize: 9 }} label={{ value: "PMAX (" + pU + ")", angle: -90, position: "insideLeft", offset: 0, fill: t.textD, fontSize: 8, letterSpacing: "0.18em", style: { textAnchor: "middle" } }} stroke={t.borderS} /><RTooltip cursor={{ fill: t.accent, fillOpacity: 0.08 }} contentStyle={{ background: t.card, border: "1px solid " + t.border, borderRadius: 8, fontSize: 10 }} itemStyle={{ color: t.text, fontWeight: 600 }} labelStyle={{ color: t.textM, fontWeight: 600 }} /><Bar dataKey="Pmax" name={"Pmax (" + pU + ")"} radius={[6, 6, 0, 0]} animationDuration={900} animationEasing="ease-out">{bd.map((e, i) => <Cell key={i} fill={e.color} />)}</Bar></BarChart></ResponsiveContainer>
               </div>;
             })()}
           </div>}
@@ -565,10 +663,11 @@ export default function App() {
                 </div>
               </div>
               {efficiency && Object.values(efficiency).some((e) => e > 100) && <div className="fadein" style={{ marginTop: 10, padding: "8px 12px", borderRadius: 8, border: "1px solid " + t.danger + "44", background: t.danger + "0d", fontSize: 10.5, color: t.danger }}>η exceeds 100 %, which is unphysical — check that cell area is in cm² and irradiance in W/m².</div>}
+              {exportError && <div className="fadein" role="alert" style={{ marginTop: 10, padding: "8px 12px", borderRadius: 8, border: "1px solid " + t.danger + "44", background: t.danger + "0d", fontSize: 10.5, color: t.danger }}>{exportError}</div>}
             </div>
             {qualityFlags.length > 0 && <div className="fadein corners" style={{ background: t.card, borderRadius: 10, border: "1px solid " + t.warn + "44", padding: "12px 16px", marginBottom: 12, position: "relative" }}>
               <div className="mono" style={{ fontSize: 8, color: t.warn, letterSpacing: ".18em", fontWeight: 700, marginBottom: 8 }}>⚠ DATA QUALITY · {qualityFlags.length} FLAG{qualityFlags.length > 1 ? "S" : ""}</div>
-              {qualityFlags.map((f, i) => <div key={i} style={{ fontSize: 10.5, color: t.textM, lineHeight: 1.6, marginBottom: 3, display: "flex", gap: 8 }}><span className="mono" style={{ color: t.text, fontWeight: 600, flexShrink: 0 }}>{f.c}</span><span>{f.w}</span></div>)}
+              {qualityFlags.map((f, i) => <div key={i} style={{ fontSize: 10.5, color: f.severity === "error" ? t.danger : t.textM, lineHeight: 1.6, marginBottom: 3, display: "flex", gap: 8 }}><span className="mono" style={{ color: f.severity === "error" ? t.danger : t.text, fontWeight: 600, flexShrink: 0 }}>{f.severity === "error" ? "ERROR · " : ""}{f.c}</span><span>{f.w}</span></div>)}
             </div>}
             <div data-tour="metrics-table" className="corners" style={{ background: t.card, borderRadius: 10, border: "1px solid " + t.border, overflow: "hidden", position: "relative" }}>
               <div style={{ padding: "10px 16px", borderBottom: "1px solid " + t.border, display: "flex", alignItems: "center", justifyContent: "space-between", background: t.cardAlt }}>
@@ -581,19 +680,19 @@ export default function App() {
                   <thead><tr style={{ borderBottom: "1px solid " + t.border, background: t.cardAlt }}>{["CONDITION", "I_SC (" + iU + ")", "V_OC (V)", "P_MAX (" + pU + ")", "FF (%)", "R_S", "R_SH"].concat(efficiency ? ["η (%)"] : []).map((h) => <th key={h} className="mono" style={{ padding: "10px 14px", textAlign: h === "CONDITION" ? "left" : "right", fontSize: 8, color: t.textD, fontWeight: 600, letterSpacing: ".14em", whiteSpace: "nowrap" }}>{h}</th>)}</tr></thead>
                   <tbody>{ds.conditions.map((c, ci) => { const m = allM[c]; if (!m) return null; const col = C8[ci % C8.length]; const colTxt = (t.chan || C8)[ci % (t.chan || C8).length]; return (
                     <tr key={c} style={{ borderBottom: "1px solid " + t.border }}>
-                      <td style={{ padding: "10px 14px", fontWeight: 600 }}><span style={{ display: "inline-flex", alignItems: "center", gap: 7 }}><span style={{ width: 8, height: 8, borderRadius: 2, background: col, boxShadow: "0 0 8px " + col + "66" }} />{c}{m.warnings.length > 0 && <span title={m.warnings.join("\n")} style={{ color: t.warn, fontSize: 10, cursor: "help" }}>⚠</span>}</span></td>
-                      <td className="mono" style={{ padding: "10px 14px", textAlign: "right" }}>{(m.isc / scales.i.div).toFixed(3)}</td>
-                      <td className="mono" style={{ padding: "10px 14px", textAlign: "right" }}>{m.voc.toFixed(3)}{m.notes.vocBeyondRange ? "*" : ""}</td>
-                      <td className="mono" style={{ padding: "10px 14px", textAlign: "right", fontWeight: 700, color: colTxt }}>{(m.pmax / scales.p.div).toFixed(3)}</td>
-                      <td style={{ padding: "10px 14px", textAlign: "right" }}><div style={{ display: "flex", alignItems: "center", gap: 7, justifyContent: "flex-end" }}><div style={{ width: 50, height: 5, borderRadius: 3, background: t.inputBg, overflow: "hidden", border: "1px solid " + t.border }}><div style={{ width: Math.min(100, m.ff * 100) + "%", height: "100%", borderRadius: 2, background: m.ff > 0.5 ? "linear-gradient(90deg,#16a34a,#22c55e)" : m.ff > 0.3 ? "linear-gradient(90deg,#d97706,#f59e0b)" : "linear-gradient(90deg,#dc2626,#f43f5e)", transition: "width .6s ease" }} /></div><span className="mono" style={{ fontSize: 10, minWidth: 36 }}>{(m.ff * 100).toFixed(1)}</span></div></td>
-                      <td className="mono" style={{ padding: "10px 14px", textAlign: "right", color: t.textM }}>{fmtSI(m.rs, "Ω", 2)}</td>
-                      <td className="mono" style={{ padding: "10px 14px", textAlign: "right", color: t.textM }}>{m.rsh === Infinity ? "∞" : fmtSI(m.rsh, "Ω", 2)}</td>
+                      <td style={{ padding: "10px 14px", fontWeight: 600 }}><span style={{ display: "inline-flex", alignItems: "center", gap: 7 }}><span style={{ width: 8, height: 8, borderRadius: 2, background: col, boxShadow: "0 0 8px " + col + "66" }} />{c}{[...(m.errors || []), ...(m.warnings || [])].length > 0 && <span title={[...(m.errors || []), ...(m.warnings || [])].join("\n")} style={{ color: m.errors?.length ? t.danger : t.warn, fontSize: 10, cursor: "help" }}>⚠</span>}</span></td>
+                      <td className="mono" style={{ padding: "10px 14px", textAlign: "right" }}>{Number.isFinite(m.isc) ? (m.isc / scales.i.div).toFixed(3) : "—"}</td>
+                      <td className="mono" title={m.status?.voc} style={{ padding: "10px 14px", textAlign: "right" }}>{m.voc == null ? "—" : (m.notes.vocBeyondRange ? "≥" : "") + m.voc.toFixed(3)}</td>
+                      <td className="mono" title={m.status?.pmax} style={{ padding: "10px 14px", textAlign: "right", fontWeight: 700, color: colTxt }}>{["measured", "interpolated", "provisional"].includes(m.status?.pmax) ? (m.pmax / scales.p.div).toFixed(3) + (m.status?.pmax === "provisional" ? "*" : "") : "—"}</td>
+                      <td style={{ padding: "10px 14px", textAlign: "right" }}>{m.ff == null ? <span className="mono" style={{ color: t.textD }}>—</span> : <div style={{ display: "flex", alignItems: "center", gap: 7, justifyContent: "flex-end" }}><div style={{ width: 50, height: 5, borderRadius: 3, background: t.inputBg, overflow: "hidden", border: "1px solid " + t.border }}><div style={{ width: Math.min(100, Math.max(0, m.ff * 100)) + "%", height: "100%", borderRadius: 2, background: m.ff > 0.5 ? "linear-gradient(90deg,#16a34a,#22c55e)" : m.ff > 0.3 ? "linear-gradient(90deg,#d97706,#f59e0b)" : "linear-gradient(90deg,#dc2626,#f43f5e)", transition: "width .6s ease" }} /></div><span className="mono" style={{ fontSize: 10, minWidth: 36 }}>{(m.ff * 100).toFixed(1)}</span></div>}</td>
+                      <td className="mono" title={m.status?.rs} style={{ padding: "10px 14px", textAlign: "right", color: t.textM }}>{m.rs == null ? "—" : fmtSI(m.rs, "Ω", 2)}</td>
+                      <td className="mono" title={m.status?.rsh} style={{ padding: "10px 14px", textAlign: "right", color: t.textM }}>{m.rsh == null ? "—" : m.rsh === Infinity ? "∞" : fmtSI(m.rsh, "Ω", 2)}</td>
                       {efficiency && <td className="mono" style={{ padding: "10px 14px", textAlign: "right", fontWeight: 600, color: t.warn }}>{efficiency[c] != null ? efficiency[c].toPrecision(3) : "-"}</td>}
                     </tr>
                   ); })}</tbody>
                 </table>
               </div>
-              {Object.values(allM).some((m) => m && m.notes.vocBeyondRange) && <div style={{ padding: "8px 16px", fontSize: 9, color: t.textM, borderTop: "1px solid " + t.border }}>* V_oc lies beyond the measured sweep range — value shown is the last sweep voltage.</div>}
+              {Object.values(allM).some((m) => m && (m.notes.vocBeyondRange || m.status?.pmax === "provisional")) && <div style={{ padding: "8px 16px", fontSize: 9, color: t.textM, borderTop: "1px solid " + t.border }}>* Sweep does not bracket V_oc: V_oc is a lower bound, P_max is provisional, and FF/R_s are withheld.</div>}
             </div>
           </div>}
 
@@ -602,17 +701,17 @@ export default function App() {
             <div style={{ maxWidth: 560, margin: "0 auto 14px" }}>
               <div className="mono" style={{ fontSize: 9, color: t.textD, letterSpacing: ".18em", fontWeight: 600, marginBottom: 6 }}>04 / DATA INGEST</div>
               <h2 style={{ fontSize: 22, fontWeight: 700, letterSpacing: "-.025em", marginBottom: 5 }}>Import Measurement Data</h2>
-              <p style={{ fontSize: 11, color: t.textM }}>Drop a workbook with voltage in column A and current sweeps in subsequent columns. Sheet headers become channel labels.</p>
+              <p style={{ fontSize: 11, color: t.textM }}>Drop an .xlsx workbook or RFC 4180 CSV with voltage in column A and signed current sweeps in subsequent columns. Sheet headers become channel labels.</p>
             </div>
             <div data-tour="dropzone" onDragOver={(e) => { e.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)} onDrop={(e) => { e.preventDefault(); setDragOver(false); if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); }} onClick={() => { if (fileRef.current) fileRef.current.click(); }} className="corners" style={{ border: "1.5px dashed " + (dragOver ? t.accent : t.border), borderRadius: 14, padding: "50px 28px", textAlign: "center", background: dragOver ? "linear-gradient(135deg," + t.accent + "14," + t.accent2 + "08)" : "linear-gradient(180deg," + t.card + "," + t.cardAlt + ")", maxWidth: 560, margin: "0 auto", transition: "all .25s", position: "relative", overflow: "hidden", cursor: "pointer" }}>
               <div className="scanline" />
               <div style={{ width: 54, height: 54, borderRadius: 14, background: dragOver ? t.accent : t.accentS, border: "1px solid " + (dragOver ? t.accent : t.accent + "33"), display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 14px", boxShadow: dragOver ? "0 0 32px " + t.accentG : "none", transition: "all .25s" }}><Ic.Upl s={26} c={dragOver ? "#fff" : t.accent} /></div>
-              <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 5 }}>{dragOver ? "Release to upload" : "Drop Excel or CSV here"}</div>
-              <div style={{ fontSize: 10.5, color: t.textM, marginBottom: 14 }}>or click to browse · supports .xlsx, .xls, .csv</div>
+              <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 5 }}>{dragOver ? "Release to upload" : "Drop XLSX or CSV here"}</div>
+              <div style={{ fontSize: 10.5, color: t.textM, marginBottom: 14 }}>or click to browse · .xlsx / .csv · 25 MB maximum</div>
               <div className="lift press" style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "9px 22px", borderRadius: 9, background: "linear-gradient(135deg," + t.accent + "," + t.accent2 + ")", color: "#fff", fontWeight: 600, fontSize: 11, boxShadow: "0 6px 20px " + t.accentG }}><Ic.File s={12} />Browse Files</div>
-              <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" style={{ display: "none" }} onChange={(e) => { if (e.target.files && e.target.files[0]) handleFile(e.target.files[0]); }} />
+              <input ref={fileRef} type="file" accept=".xlsx,.csv" style={{ display: "none" }} onChange={(e) => { if (e.target.files && e.target.files[0]) handleFile(e.target.files[0]); e.target.value = ""; }} />
               <div className="mono" style={{ marginTop: 18, paddingTop: 14, borderTop: "1px dashed " + t.border, display: "flex", justifyContent: "center", gap: 18, fontSize: 9, color: t.textD, letterSpacing: ".06em" }}>
-                <span>FORMAT · COL A = V, COL B+ = I</span><span>·</span><span>UNITS · VOLTS / AMPS</span>
+                <span>FORMAT · COL A = V, COL B+ = SIGNED I</span><span>·</span><span>UNITS · VOLTS / AMPS</span>
               </div>
             </div>
             {importError && <div className="fadein" style={{ maxWidth: 560, margin: "12px auto 0", padding: "10px 14px", borderRadius: 9, border: "1px solid " + t.danger + "44", background: t.danger + "0d", color: t.danger, fontSize: 11, lineHeight: 1.55, display: "flex", gap: 8, alignItems: "flex-start" }}><span style={{ flexShrink: 0 }}>⚠</span><span>{importError}</span></div>}
@@ -636,10 +735,10 @@ export default function App() {
           {page === "about" && <AboutPage t={t} />}
         </main>
 
-        {/* Instrument status strip — the quiet Solavin signature. */}
+        {/* Application status strip. */}
         <footer className="mono" style={{ flexShrink: 0, borderTop: "1px solid " + t.border, background: t.cardAlt, padding: "5px 18px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, fontSize: 8.5, color: t.textD, letterSpacing: ".12em" }}>
-          <span style={{ display: "inline-flex", alignItems: "center", gap: 7, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}><Logo s={13} /> SOLAVIN · PRECISION PV CHARACTERIZATION</span>
-          <span style={{ whiteSpace: "nowrap" }}>ISC · VOC · PMAX · FF · η — v3.1.0</span>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 7, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}><Logo s={13} /> SOLAVIN · RESEARCH PV ANALYSIS</span>
+          <span style={{ whiteSpace: "nowrap" }}>ISC · VOC · PMAX · FF · η — v4.0.0</span>
         </footer>
       </div>
 
@@ -649,7 +748,7 @@ export default function App() {
 
       {tourStep >= 0 && <TourOverlay t={t} step={tourStep} onNext={() => setTourStep(tourStep + 1)} onBack={() => { if (tourStep > 0) setTourStep(tourStep - 1); }} onSkip={dismissTour} onNav={setPage} onVizTab={setVizTab} onChat={() => setChatOpen(true)} onCloseChat={() => setChatOpen(false)} />}
 
-      {sheetPicker && <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.65)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 300, backdropFilter: "blur(6px)" }}><div className="slideup" style={{ background: t.card, borderRadius: 14, padding: 24, border: "1px solid " + t.border, maxWidth: 360, width: "90%", boxShadow: t.shadow }}><div style={{ fontWeight: 700, fontSize: 14, marginBottom: 10 }}>Select Sheet</div>{sheetPicker.valid.map((s) => <button key={s} onClick={() => doLoad(sheetPicker.file.name, sheetPicker.sheets, s)} style={{ display: "block", width: "100%", padding: "9px 13px", marginBottom: 4, borderRadius: 8, border: "1px solid " + t.border, background: t.inputBg, color: t.text, fontSize: 11, textAlign: "left" }}>{s}</button>)}<button onClick={() => setSheetPicker(null)} style={{ marginTop: 6, background: "none", border: "none", color: t.textM, fontSize: 10 }}>Cancel</button></div></div>}
+      {sheetPicker && <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.65)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 300, backdropFilter: "blur(6px)" }}><div className="slideup" style={{ background: t.card, borderRadius: 14, padding: 24, border: "1px solid " + t.border, maxWidth: 360, width: "90%", boxShadow: t.shadow }}><div style={{ fontWeight: 700, fontSize: 14, marginBottom: 10 }}>Select Sheet</div>{sheetPicker.valid.map((s) => <button key={s} onClick={() => doLoad(sheetPicker.fileName, sheetPicker.sheets, s)} style={{ display: "block", width: "100%", padding: "9px 13px", marginBottom: 4, borderRadius: 8, border: "1px solid " + t.border, background: t.inputBg, color: t.text, fontSize: 11, textAlign: "left" }}>{s}</button>)}<button onClick={() => setSheetPicker(null)} style={{ marginTop: 6, background: "none", border: "none", color: t.textM, fontSize: 10 }}>Cancel</button></div></div>}
     </div>
   );
 }

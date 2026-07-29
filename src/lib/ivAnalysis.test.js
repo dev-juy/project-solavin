@@ -193,7 +193,8 @@ describe("calcMetrics — data-quality warnings", () => {
       { voltage: 0.5, rawCurrent: -1.2 },
       { voltage: 1.0, rawCurrent: -1.4 },
     ]);
-    expect(m.warnings.some((w) => /Isc ≤ 0/.test(w))).toBe(true);
+    expect(m.errors.some((w) => /Isc ≤ 0/.test(w))).toBe(true);
+    expect(m.quality).toBe("invalid");
   });
 
   it("flags non-monotonic current between 0 V and Voc", () => {

@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use Solavin in research, please cite the software and record the exact analysis version."
+title: "Solavin: Photovoltaic Characterization and Analysis Suite"
+type: software
+version: 4.0.0
+date-released: 2026-07-29
+authors:
+  - family-names: Uy
+    given-names: John Myron
+repository-code: "https://github.com/dev-juy/project-solavin"
+url: "https://github.com/dev-juy/project-solavin"
+license: MIT

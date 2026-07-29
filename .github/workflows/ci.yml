@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: solavin-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+      - name: Scientific validation and coverage gates
+        run: npm run test:coverage
+      - name: Production and standalone builds
+        run: npm run build:all
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Browser integration test
+        run: node tests/e2e.smoke.mjs
+      - name: Upload standalone artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: solavin-v4-standalone
+          path: dist-standalone/index.html
+          if-no-files-found: error
+          retention-days: 14

@@ -13,5 +13,16 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["src/**/*.test.js"],
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "json-summary", "html"],
+      include: ["src/lib/ivAnalysis.js"],
+      thresholds: {
+        statements: 90,
+        branches: 80,
+        functions: 90,
+        lines: 90,
+      },
+    },
   },
 });

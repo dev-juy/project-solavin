@@ -1,144 +1,170 @@
-# project-solavin# Solavin — Photovoltaic Characterization Suite
+# Solavin
 
-A lab-grade web application for analysing photovoltaic **current–voltage (I-V)**
-sweeps. Upload measured data, and Solavin extracts the standard figures of
-merit — short-circuit current (I<sub>sc</sub>), open-circuit voltage
-(V<sub>oc</sub>), maximum power (P<sub>max</sub>), fill factor (FF), series and
-shunt resistance (R<sub>s</sub>, R<sub>sh</sub>) and power-conversion efficiency
-(η) — with interactive I-V / P-V / radar visualisations and one-click CSV/Excel
-export.
+Solavin is a research-oriented web application for inspecting photovoltaic
+current-voltage (I-V) sweeps. It extracts I<sub>sc</sub>, V<sub>oc</sub>,
+P<sub>max</sub>, V<sub>mp</sub>, I<sub>mp</sub>, fill factor, local slope
+estimates of R<sub>s</sub>/R<sub>sh</sub>, and—when area and irradiance are
+provided—power-conversion efficiency.
 
-Built with React 18 + Vite + Recharts. The scientific core is plain,
-dependency-free JavaScript covered by an automated test suite, so results are
-reproducible and verifiable.
+The application is designed to make questionable data visible rather than turn
+it into precise-looking numbers. Missing cells remain missing, unbracketed
+V<sub>oc</sub> values are reported as lower bounds, dependent metrics are
+withheld when they cannot be supported, and every export carries analysis
+status and provenance.
 
-> Developed by **John Myron Uy**, under the guidance of **Prof. Raymund Sarmiento** —
-> Research Laboratory, Solar Cell Characterization.
+> Solavin validates calculations performed on supplied data. It does not
+> calibrate an instrument or certify a photovoltaic measurement to IEC 60904-1.
+> Measurement uncertainty, spectral mismatch, temperature control, irradiance
+> uniformity, sweep protocol, contact quality, and instrument calibration remain
+> the operator's responsibility.
 
----
+Developed by **John Myron Uy**, under the guidance of
+**Prof. Raymund Sarmiento** — Research Laboratory, Solar Cell
+Characterization.
 
-## Highlights
+## What researchers get
 
-- **Parameter extraction** — I<sub>sc</sub>, V<sub>oc</sub>, P<sub>max</sub>,
-  V<sub>mp</sub>, I<sub>mp</sub>, FF, R<sub>s</sub>, R<sub>sh</sub>, η.
-- **Multi-channel** — load many sweep conditions per dataset and compare them.
-- **Visualisations** — I-V, P-V (with MPP markers), normalised radar profile,
-  and ranked P<sub>max</sub> comparison; brush-to-zoom and a voltage cursor
-  lookup.
-- **Data ingest** — drag-and-drop `.xlsx` / `.xls` / `.csv`; multi-sheet picker.
-- **Export** — CSV and XLSX of the full metrics table, including η when area and
-  irradiance are supplied.
-- **Lab Assistant** — an offline, deterministic analyser that answers from the
-  extracted metrics (summaries, rankings, fill-factor interpretation, suggested
-  experiments). No external API, no keys.
-- **Local operator profiles** — name a session to keep a persistent dataset
-  library in your browser, or work in demo mode. No passwords, no backend.
-- **Two build targets** — a normal web app for hosting, and a single
-  self-contained `.html` you can email or run offline from `file://`.
+- Piecewise-linear I-V and P-V plots that do not invent smoothed extrema.
+- Exact maximum-power optimization on each measured linear segment.
+- Voltage-keyed alignment across sparse channels, so one missing cell cannot
+  shift later measurements onto the wrong voltage.
+- Explicit `pass`, `review`, and `invalid` channel states.
+- CSV and three-sheet XLSX exports:
+  - `Metrics` — values, units, per-metric status, quality flags, source, and
+    analysis version.
+  - `Raw Data` — signed measurements aligned by voltage with gaps preserved.
+  - `Metadata` — conventions, handling rules, source, and import warnings.
+- Safe `.xlsx` and RFC 4180 CSV ingestion with a 25 MB browser limit.
+- A deterministic offline assistant that only summarizes validated extracted
+  results.
+- A normal hosted build and a self-contained offline HTML build.
 
-## Accuracy & conventions
+## Analysis definitions
 
-Photovoltaic figures of merit are computed in
-[`src/lib/ivAnalysis.js`](src/lib/ivAnalysis.js) on the **signed** current
-(generator convention: current is positive in the power-producing quadrant and
-negative beyond V<sub>oc</sub>).
+All scientific calculations live in
+[`src/lib/ivAnalysis.js`](src/lib/ivAnalysis.js). Current uses the generator
+convention: current is positive while the device produces positive V·I power
+and negative beyond V<sub>oc</sub>.
 
-| Quantity | Definition used |
-|----------|-----------------|
-| I<sub>sc</sub> | Current at V = 0 (exact sample, else interpolated; extrapolated if the sweep starts above 0 V). |
-| V<sub>oc</sub> | Voltage at the first I = 0 crossing (linear interpolation). Flagged if it lies beyond the sweep range. |
-| P<sub>max</sub>, V<sub>mp</sub>, I<sub>mp</sub> | Maximum of V·I, **restricted to the power quadrant** (V ≥ 0, I ≥ 0). |
-| FF | P<sub>max</sub> / (I<sub>sc</sub> · V<sub>oc</sub>) — always < 1 for physical data. |
-| R<sub>s</sub> | \|dV/dI\| near V<sub>oc</sub> (slope estimate). |
-| R<sub>sh</sub> | \|dV/dI\| near I<sub>sc</sub> (slope estimate). |
-| η | P<sub>max</sub> / (G · A), with cell area in cm² and irradiance G in W/m². |
+| Quantity | Definition and validity rule |
+|---|---|
+| I<sub>sc</sub> | Signed current at V = 0. Uses an exact sample, interpolation across zero, or a flagged nearest-pair extrapolation. |
+| V<sub>oc</sub> | First non-negative-voltage positive-to-negative current crossing, linearly interpolated. If no crossing is measured, the highest measured voltage is only a lower bound. |
+| P<sub>max</sub> | Maximum of V·I in the measured power quadrant. The maximum is solved analytically on every piecewise-linear segment. |
+| V<sub>mp</sub>, I<sub>mp</sub> | Coordinates of the same piecewise-linear P<sub>max</sub> solution. |
+| FF | P<sub>max</sub> / (I<sub>sc</sub>·V<sub>oc</sub>). Withheld if V<sub>oc</sub> is unbracketed; out-of-range results are reported as errors, never clamped. |
+| R<sub>s</sub> | \|dV/dI\| from a local multi-point linear fit near V<sub>oc</sub>. Withheld when V<sub>oc</sub> is unbracketed or the fit is degenerate. |
+| R<sub>sh</sub> | \|dV/dI\| from a local multi-point linear fit near V = 0. |
+| η | P<sub>max</sub> / (G·A), with P in W, G in W/m², and illuminated area entered in cm². |
 
-R<sub>s</sub> and R<sub>sh</sub> are first-order slope estimates from a single
-light sweep; a dark I-V curve or a full single-diode fit gives more rigorous
-values.
+R<sub>s</sub> and R<sub>sh</sub> are local light-sweep slope estimates, not a
+substitute for uncertainty-aware parameter fitting or dark-I-V analysis.
 
-The test suite ([`src/lib/ivAnalysis.test.js`](src/lib/ivAnalysis.test.js))
-asserts these invariants on every build — including that the fill factor is
-always between 0 and 100 % — so the extraction cannot silently regress.
+## Validation
 
-## Data format
+The automated suite currently contains 53 tests, including:
 
-Column **A** is voltage (volts); each subsequent column is one current sweep
-(amperes, signed). Row 1 holds headers, which become channel labels.
+- 300 deterministic randomized linear curves checked against closed-form
+  I<sub>sc</sub>, V<sub>oc</sub>, P<sub>max</sub>, V<sub>mp</sub>,
+  I<sub>mp</sub>, and FF solutions.
+- Six continuous single-diode curves spanning nanoampere to ampere scales,
+  checked against an independent golden-section maximum-power oracle.
+- Current-scale invariance checks.
+- Censored sweeps, nonphysical curves, duplicate voltages, all-negative and
+  sparse sweeps.
+- Blank cells, duplicate/blank headers, malicious labels, quoted and malformed
+  CSV, input safety limits, and spreadsheet-formula neutralization.
+- Raw-data alignment, status/provenance export, and invalid efficiency inputs.
 
+Coverage gates apply to the scientific core: at least 90% statements, 80%
+branches, 90% functions, and 90% lines. CI additionally performs a high-severity
+dependency audit, both production builds, and a real-Chromium import,
+visualization, assistant, and CSV/XLSX download smoke test.
+
+See [`docs/VALIDATION.md`](docs/VALIDATION.md) for the audit register,
+tolerances, reproducibility commands, and residual limitations.
+
+## Input format
+
+Use `.xlsx` or `.csv`. Column A is voltage in volts. Each subsequent column is
+one signed current sweep in amperes, and row 1 contains channel labels.
+
+```csv
+Voltage (V),Focused Laser,-2 mm,+6 mm Focus
+0,1.539e-6,1.460e-6,1.583e-6
+0.05,1.528e-6,1.456e-6,1.565e-6
+2.50,-3.875e-6,-3.052e-6,-2.923e-6
 ```
-Voltage(V), Focused Laser, -2mm, +6mm Focus
-0,          1.539e-6,      1.46e-6, 1.583e-6
-0.05,       1.528e-6,      1.456e-6, 1.565e-6
-...
-2.5,        -3.875e-6,     -3.052e-6, -2.923e-6
-```
 
-A ready-to-upload example lives in
-[`examples/sample_iv_data.csv`](examples/sample_iv_data.csv) (the same dataset
-the app loads by default).
+Rules:
 
-## Getting started
+- Every accepted channel must contain at least three unique voltage setpoints
+  with valid voltage-current pairs.
+- Blank or nonnumeric current cells are skipped and reported; they are never
+  converted to zero.
+- Exact duplicate voltage setpoints are averaged and flagged.
+- Blank and duplicate channel headers are assigned unique visible names.
+- Legacy `.xls` files are intentionally rejected; convert them to `.xlsx` or
+  CSV first.
+
+The bundled example is
+[`examples/sample_iv_data.csv`](examples/sample_iv_data.csv).
+
+## Run and verify
+
+Node.js 22 is the CI reference runtime.
 
 ```bash
-npm install
-npm run dev          # start the dev server (http://localhost:5173)
-npm test             # run the physics unit tests
-npm run build        # production build → dist/
-npm run build:standalone   # single self-contained file → dist-standalone/index.html
-npm run build:all    # both builds
+npm ci
+npm run validate       # dependency audit, coverage-gated tests, both builds
+npm run test:e2e       # standalone build + real-browser smoke test
+npm run dev            # local development server
 ```
 
-### Standalone file
+Build targets:
 
-`npm run build:standalone` produces `dist-standalone/index.html` — a single file
-with all JavaScript and CSS inlined. Open it directly (`file://…`) with no server;
-it works offline (web fonts fall back to system fonts when there's no network).
-
-## Deployment (Netlify)
-
-This repo includes [`netlify.toml`](netlify.toml). To go live:
-
-1. Push the repository to GitHub.
-2. In the Netlify dashboard, **Add new site → Import an existing project** and
-   pick this repo.
-3. Netlify reads `netlify.toml` automatically (build `npm run build`, publish
-   `dist`). No manual configuration needed.
-
-Every push then redeploys. The continuous-integration workflow
-([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the unit tests and
-both builds, and uploads the standalone HTML as a downloadable artifact.
-
-## Project structure
-
+```bash
+npm run build              # dist/
+npm run build:standalone   # dist-standalone/index.html
+npm run build:all          # both
 ```
+
+The standalone file contains the application code and can run from `file://`
+without a backend. Browser profile and dataset storage is local and is not an
+authentication or access-control system.
+
+## Project map
+
+```text
 src/
   lib/
-    ivAnalysis.js        # parameter extraction + parsing + export helpers (pure)
-    ivAnalysis.test.js   # physics invariants & reference-value tests
-    assistant.js         # deterministic, offline dataset analyser
+    ivAnalysis.js
+    ivAnalysis.test.js
+    ivAnalysis.validation.test.js
+    assistant.js
   components/
-    ProfileGate.jsx      # local operator gate (no passwords)
-    Tour.jsx             # guided walkthrough overlay
-    Assistant.jsx        # lab-assistant side panel
-    shared.jsx           # chart tooltip, channel toggles, lookup, raw-data table
-    AboutPage.jsx
-  App.jsx                # main application
-  theme.js  icons.jsx  persistence.js  styles.css  main.jsx
-examples/sample_iv_data.csv
-tests/e2e.smoke.mjs      # optional browser smoke test (skips if no Chromium)
+  App.jsx
+docs/
+  VALIDATION.md
+examples/
+  sample_iv_data.csv
+tests/
+  e2e.smoke.mjs
+.github/workflows/
+  ci.yml
 ```
 
-## Testing
+## Standards context
 
-- `npm test` — Vitest unit tests for the extraction math (run in CI).
-- `npm run test:e2e` — optional Playwright smoke test that builds the standalone
-  bundle, drives it in a real browser, and verifies the app mounts cleanly with
-  physical fill factors. Playwright is **not** a default dependency; install it
-  first with `npm i -D playwright && npx playwright install chromium`. The test
-  skips automatically (exit 0) if Playwright or a browser is unavailable, so it
-  never blocks CI.
+IEC 60904-1 defines measurement requirements for photovoltaic I-V
+characteristics; Solavin is an analysis and visualization layer, not an IEC
+conformity claim. NREL's photovoltaic measurement guidance likewise emphasizes
+calibration and uncertainty in the upstream measurement chain.
 
-## License
+- [IEC 60904-1:2020 — Photovoltaic devices, Part 1](https://webstore.iec.ch/en/publication/32004)
+- [NREL — Trust But Verify: Creating and Using Highly Accurate Measurements in Solar Research](https://www.nrel.gov/docs/fy05osti/36527.pdf)
 
-[MIT](LICENSE) © 2026 John Myron Uy.
+## License and citation
+
+[MIT](LICENSE) © 2026 John Myron Uy. Citation metadata is provided in
+[`CITATION.cff`](CITATION.cff).

@@ -14,34 +14,43 @@ import { fmtSI } from "./ivAnalysis.js";
 // cell scale (µA lab devices through A-scale production cells).
 const fmt = {
   isc: (m) => fmtSI(m.isc, "A"),
-  voc: (m) => m.voc.toFixed(3) + " V",
-  pmax: (m) => fmtSI(m.pmax, "W"),
-  ff: (m) => (m.ff * 100).toFixed(1) + " %",
-  rs: (m) => fmtSI(m.rs, "Ω", 2),
-  rsh: (m) => (m.rsh === Infinity ? "∞" : fmtSI(m.rsh, "Ω", 2)),
+  voc: (m) => m.voc == null ? "unavailable" : `${m.status?.voc === "lower-bound" ? "≥ " : ""}${m.voc.toFixed(3)} V`,
+  pmax: (m) => `${fmtSI(m.pmax, "W")}${m.status?.pmax === "provisional" ? " (provisional)" : ""}`,
+  ff: (m) => Number.isFinite(m.ff) ? (m.ff * 100).toFixed(1) + " %" : "withheld",
+  rs: (m) => m.rs == null ? "withheld" : fmtSI(m.rs, "Ω", 2),
+  rsh: (m) => m.rsh == null ? "withheld" : (m.rsh === Infinity ? "∞" : fmtSI(m.rsh, "Ω", 2)),
 };
+
+function reportable(m, key) {
+  if (!m || m.quality === "invalid" || !Number.isFinite(m[key])) return false;
+  if (key === "voc") return m.status?.voc === "measured" || m.status?.voc === "interpolated";
+  if (key === "pmax") return m.status?.pmax === "measured" || m.status?.pmax === "interpolated";
+  if (key === "ff") return m.status?.ff === "computed";
+  if (key === "isc") return m.status?.isc !== "unavailable";
+  return true;
+}
 
 function rankBy(dataset, allMetrics, key) {
   return dataset.conditions
     .map((c) => ({ c, m: allMetrics[c] }))
-    .filter((x) => x.m)
+    .filter((x) => reportable(x.m, key))
     .sort((a, b) => b.m[key] - a.m[key]);
 }
 
 function summarize(dataset, allMetrics) {
+  const lines = dataset.conditions.map((c) => {
+    const m = allMetrics[c];
+    if (!m) return `• ${c}: insufficient valid samples`;
+    if (m.quality === "invalid")
+      return `• ${c} [INVALID]: metrics are not reportable; inspect the channel's data-quality errors`;
+    const flag = m.quality === "pass" ? "" : ` [${m.quality.toUpperCase()}]`;
+    return `• ${c}${flag}: Pmax ${fmt.pmax(m)}, Isc ${fmt.isc(m)}, Voc ${fmt.voc(m)}, FF ${fmt.ff(m)}`;
+  });
   const ranked = rankBy(dataset, allMetrics, "pmax");
-  if (!ranked.length) return "No metrics available for the active dataset.";
-  const best = ranked[0];
-  const worst = ranked[ranked.length - 1];
-  const lines = ranked.map(
-    ({ c, m }) => `• ${c}: Pmax ${fmt.pmax(m)}, Isc ${fmt.isc(m)}, Voc ${fmt.voc(m)}, FF ${fmt.ff(m)}`
-  );
-  return (
-    `Summary — ${dataset.name}\n\n` +
-    lines.join("\n") +
-    `\n\nHighest Pmax: ${best.c} (${fmt.pmax(best.m)}).` +
-    `\nLowest Pmax: ${worst.c} (${fmt.pmax(worst.m)}).`
-  );
+  const ranking = ranked.length
+    ? `\n\nHighest reportable Pmax: ${ranked[0].c} (${fmt.pmax(ranked[0].m)}).`
+    : "\n\nNo channel has a reportable Pmax; review the data-quality flags.";
+  return `Summary — ${dataset.name}\n\n${lines.join("\n")}${ranking}`;
 }
 
 function compare(dataset, allMetrics) {
@@ -57,7 +66,7 @@ function compare(dataset, allMetrics) {
 
 function fillFactor(dataset, allMetrics) {
   const ranked = rankBy(dataset, allMetrics, "ff");
-  if (!ranked.length) return "No fill-factor data available.";
+  if (!ranked.length) return "No reportable fill-factor values are available. Solavin withholds FF when Voc is not bracketed or a channel fails physical checks.";
   const vals = ranked.map((x) => x.m.ff * 100);
   const lo = Math.min(...vals).toFixed(1);
   const hi = Math.max(...vals).toFixed(1);
@@ -66,16 +75,19 @@ function fillFactor(dataset, allMetrics) {
     `Fill factor measures how "square" the I-V curve is:\n` +
     `FF = Pmax / (Isc · Voc).\n\n` +
     `This dataset ranges ${lo}–${hi} %. Best: ${best.c} at ${fmt.ff(best.m)}.\n\n` +
-    `Values in this range are typical for cells measured below standard ` +
-    `illumination and/or with appreciable series resistance — both push the ` +
-    `knee of the curve inward. Crystalline silicon at STC typically reaches ` +
-    `70–82 %.`
+    `Interpret FF in the context of device technology, illumination, temperature, ` +
+    `sweep protocol, and uncertainty. High series resistance, low shunt resistance, ` +
+    `recombination, or measurement artefacts can all reduce FF; one light sweep ` +
+    `cannot identify the cause by itself.`
   );
 }
 
 function resistances(dataset, allMetrics) {
   const lines = dataset.conditions
-    .map((c) => allMetrics[c] && `• ${c}: Rs ≈ ${fmt.rs(allMetrics[c])}, Rsh ≈ ${fmt.rsh(allMetrics[c])}`)
+    .map((c) => {
+      const m = allMetrics[c];
+      return m && m.quality !== "invalid" && `• ${c}: Rs ≈ ${fmt.rs(m)}, Rsh ≈ ${fmt.rsh(m)}`;
+    })
     .filter(Boolean);
   return (
     `Series (Rs) and shunt (Rsh) resistance estimates, from the I-V slope near ` +
@@ -90,7 +102,7 @@ function resistances(dataset, allMetrics) {
 function nextSteps() {
   return (
     "Suggested next experiments:\n" +
-    "1. Measure under calibrated AM1.5G (1000 W/m²) to report STC efficiency.\n" +
+    "1. If reporting STC performance, use a calibrated AM1.5G-equivalent setup at 1000 W/m² and control device temperature.\n" +
     "2. Run a temperature sweep to extract dV_oc/dT and dI_sc/dT coefficients.\n" +
     "3. Acquire a dark I-V curve to separate Rs, Rsh and the diode ideality factor.\n" +
     "4. Repeat sweeps to quantify measurement repeatability (error bars).\n" +
@@ -128,10 +140,12 @@ export function analyze(message, ctx) {
 
   if (/voc|open.?circuit/.test(l)) {
     const r = rankBy(dataset, allMetrics, "voc")[0];
+    if (!r) return "No reportable Voc is available. The sweep must include a positive-to-negative current crossing at non-negative voltage.";
     return `Voc is the voltage at zero current (the I-V curve's x-intercept). Highest here: ${r.c} at ${fmt.voc(r.m)}.`;
   }
   if (/isc|short.?circuit/.test(l)) {
     const r = rankBy(dataset, allMetrics, "isc")[0];
+    if (!r) return "No reportable Isc is available. Check the current sign convention and whether the sweep reaches or brackets V = 0.";
     return `Isc is the current at zero volts. Highest here: ${r.c} at ${fmt.isc(r.m)}.`;
   }
 

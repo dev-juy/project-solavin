@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef } from "react";
 import { C8 } from "../theme.js";
 import { Ic } from "../icons.jsx";
+import { buildAlignedRows } from "../lib/ivAnalysis.js";
 
 /**
  * Renders a number that tweens to a new value instead of snapping — used on
- * the dashboard stat cards so switching datasets reads as a live instrument
- * reading rather than a re-render. Skips the animation under
+ * the dashboard stat cards so switching datasets has a smooth visual
+ * transition. Skips the animation under
  * prefers-reduced-motion, matching the rest of the app's motion tokens
  * (420ms, cubic ease-out — see --dur-slow / --ease-fluid in styles.css).
  */
@@ -86,8 +87,9 @@ export function Toggles(p) {
 /**
  * Voltage cursor lookup → current per channel at the requested voltage.
  * Linearly interpolates between the two samples that bracket the target
- * (the same convention used for Isc/Voc extraction); clamps to the nearest
- * endpoint when the target lies outside the measured range, and says so.
+ * (the same convention used for Isc/Voc extraction). Values outside a
+ * channel's measured range are unavailable, never extrapolated. Duplicate
+ * setpoints use the same explicit average as charts and metrics.
  * `iSc` is the dataset-wide SI scale ({div, prefix}) so units match the charts.
  */
 export function VLookup(p) {
@@ -100,15 +102,21 @@ export function VLookup(p) {
     if (isNaN(v)) { setResult(null); return; }
     const r = [];
     p.ds.conditions.forEach((c) => {
-      const pts = [...p.ds.ivData[c]].sort((a, b) => a.voltage - b.voltage);
+      const pts = buildAlignedRows(p.ds, [c]).map((row) => ({
+        voltage: row.voltage,
+        rawCurrent: row[c],
+      }));
       if (!pts.length) return;
       let current, source;
-      if (v <= pts[0].voltage) {
+      if (v < pts[0].voltage || v > pts[pts.length - 1].voltage) {
+        current = null;
+        source = "out of range";
+      } else if (v === pts[0].voltage) {
         current = pts[0].rawCurrent;
-        source = v === pts[0].voltage ? "measured" : "out of range";
-      } else if (v >= pts[pts.length - 1].voltage) {
+        source = "measured";
+      } else if (v === pts[pts.length - 1].voltage) {
         current = pts[pts.length - 1].rawCurrent;
-        source = v === pts[pts.length - 1].voltage ? "measured" : "out of range";
+        source = "measured";
       } else {
         let j = 0;
         while (j < pts.length - 1 && pts[j + 1].voltage < v) j++;
@@ -140,7 +148,7 @@ export function VLookup(p) {
             <tbody>{result.map((r, i) => (
               <tr key={i} style={{ borderBottom: "1px solid " + t.border }}>
                 <td style={{ padding: "6px 10px" }}><span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}><span style={{ width: 6, height: 6, borderRadius: 2, background: C8[i % C8.length] }} />{r.cond}</span></td>
-                <td className="mono" style={{ padding: "6px 10px", textAlign: "right" }}>{(r.current / iSc.div).toFixed(4)}</td>
+                <td className="mono" style={{ padding: "6px 10px", textAlign: "right" }}>{Number.isFinite(r.current) ? (r.current / iSc.div).toFixed(4) : "—"}</td>
                 <td className="mono" style={{ padding: "6px 10px", textAlign: "right", color: r.source === "out of range" ? t.warn : t.textM, fontSize: 8.5, letterSpacing: ".04em" }}>{r.source.toUpperCase()}</td>
               </tr>
             ))}</tbody>
@@ -174,7 +182,7 @@ export function RawDataViewer(p) {
   if (!ds) return null;
 
   const allCols = ["voltage"].concat(ds.conditions);
-  const rows = ds.ivData[ds.conditions[0]] || [];
+  const rows = buildAlignedRows(ds, ds.conditions);
 
   function doSearch() {
     setWarning(""); setMatchIdx(-1);
@@ -192,14 +200,19 @@ export function RawDataViewer(p) {
       setMatchIdx(bestI);
     } else {
       if (isNaN(num)) { setWarning("Enter a numeric current value (in Amps, e.g. 1.5e-6)."); return; }
-      const pts = ds.ivData[searchCol];
-      if (!pts || pts.length === 0) { setWarning('No data for condition "' + searchCol + '".'); return; }
-      let bestI = 0, bestD = Math.abs(pts[0].rawCurrent - num);
-      for (let i = 1; i < pts.length; i++) { const d = Math.abs(pts[i].rawCurrent - num); if (d < bestD) { bestD = d; bestI = i; } }
-      const relErr = pts[bestI].rawCurrent !== 0 ? bestD / Math.abs(pts[bestI].rawCurrent) : bestD;
-      if (relErr > 0.1) setWarning("No close match found. Nearest is " + pts[bestI].rawCurrent.toExponential(3) + " A at V = " + pts[bestI].voltage.toFixed(3) + "V.");
-      else if (bestD > 0) setWarning("Nearest match: " + pts[bestI].rawCurrent.toExponential(3) + " A at V = " + pts[bestI].voltage.toFixed(3) + "V.");
-      setMatchIdx(bestI);
+      const candidates = rows
+        .map((row, index) => ({ index, voltage: row.voltage, current: row[searchCol] }))
+        .filter((entry) => Number.isFinite(entry.current));
+      if (!candidates.length) { setWarning('No data for condition "' + searchCol + '".'); return; }
+      let best = candidates[0], bestD = Math.abs(candidates[0].current - num);
+      for (let i = 1; i < candidates.length; i++) {
+        const d = Math.abs(candidates[i].current - num);
+        if (d < bestD) { bestD = d; best = candidates[i]; }
+      }
+      const relErr = best.current !== 0 ? bestD / Math.abs(best.current) : bestD;
+      if (relErr > 0.1) setWarning("No close match found. Nearest is " + best.current.toExponential(3) + " A at V = " + best.voltage.toFixed(3) + "V.");
+      else if (bestD > 0) setWarning("Nearest match: " + best.current.toExponential(3) + " A at V = " + best.voltage.toFixed(3) + "V.");
+      setMatchIdx(best.index);
     }
   }
   const isErr = (w) => w.indexOf("outside") !== -1 || w.indexOf("No close") !== -1 || w.indexOf("not found") !== -1;
@@ -241,7 +254,7 @@ export function RawDataViewer(p) {
               out.push(
                 <tr key={ri} style={{ height: ROW_H, background: isMatch ? "rgba(59,130,246,.12)" : ri % 2 ? t.cardAlt : "transparent", transition: "background .2s" }}>
                   <td className="mono" style={{ padding: "0 8px", fontSize: 9, whiteSpace: "nowrap", fontWeight: isMatch ? 700 : 600, color: isMatch ? t.accent : t.text }}>{row.voltage.toFixed(2)}</td>
-                  {ds.conditions.map((c, ci) => { const pt = ds.ivData[c][ri]; return <td key={ci} className="mono" style={{ padding: "0 8px", fontSize: 9, whiteSpace: "nowrap", textAlign: "right", color: isMatch && c === searchCol ? t.accent : (t.chan || C8)[ci % (t.chan || C8).length], fontWeight: isMatch && c === searchCol ? 700 : 400 }}>{pt ? pt.rawCurrent.toExponential(3) : "-"}</td>; })}
+                  {ds.conditions.map((c, ci) => { const value = row[c]; return <td key={ci} className="mono" style={{ padding: "0 8px", fontSize: 9, whiteSpace: "nowrap", textAlign: "right", color: isMatch && c === searchCol ? t.accent : (t.chan || C8)[ci % (t.chan || C8).length], fontWeight: isMatch && c === searchCol ? 700 : 400 }}>{Number.isFinite(value) ? value.toExponential(3) : "—"}</td>; })}
                 </tr>
               );
             }
