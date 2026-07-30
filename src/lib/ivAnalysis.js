@@ -22,14 +22,19 @@
  *   - current    : |rawCurrent|, kept only for legacy display helpers
  */
 
+export const ANALYSIS_VERSION = "4.0.0";
+export const ANALYSIS_METHOD = "piecewise-linear-v4";
+const MAX_WORKSHEET_ROWS = 250000;
+const MAX_WORKSHEET_COLUMNS = 2048;
+
 /** Linear interpolation of y at target x between (x0,y0) and (x1,y1). */
 function lerp(x, x0, y0, x1, y1) {
   if (x1 === x0) return y0;
   return y0 + ((x - x0) * (y1 - y0)) / (x1 - x0);
 }
 
-/** Least-squares slope of y(x); null when degenerate (fewer than 2 points or all x equal). */
-function lsqSlope(xs, ys) {
+/** Least-squares line fit of y(x); null when degenerate. */
+function linearFit(xs, ys) {
   const n = xs.length;
   if (n < 2) return null;
   let sx = 0, sy = 0, sxx = 0, sxy = 0;
@@ -37,8 +42,27 @@ function lsqSlope(xs, ys) {
     sx += xs[k]; sy += ys[k]; sxx += xs[k] * xs[k]; sxy += xs[k] * ys[k];
   }
   const den = n * sxx - sx * sx;
-  if (den === 0) return null;
-  return (n * sxy - sx * sy) / den;
+  if (!Number.isFinite(den) || den === 0) return null;
+  const slope = (n * sxy - sx * sy) / den;
+  const intercept = (sy - slope * sx) / n;
+  if (!Number.isFinite(slope) || !Number.isFinite(intercept)) return null;
+  const mean = sy / n;
+  let ssRes = 0, ssTot = 0;
+  for (let k = 0; k < n; k++) {
+    ssRes += (ys[k] - (intercept + slope * xs[k])) ** 2;
+    ssTot += (ys[k] - mean) ** 2;
+  }
+  const r2 = ssTot === 0 ? 1 : 1 - ssRes / ssTot;
+  return { slope, intercept, r2, points: n, rmse: Math.sqrt(ssRes / n) };
+}
+
+function finiteNumber(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : NaN;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : NaN;
+  }
+  return NaN;
 }
 
 /**
@@ -47,8 +71,75 @@ function lsqSlope(xs, ys) {
  */
 function signedCurrent(pt) {
   if (pt == null) return NaN;
-  if (typeof pt.rawCurrent === "number") return pt.rawCurrent;
-  return Number(pt.current);
+  if (pt.rawCurrent != null) return finiteNumber(pt.rawCurrent);
+  return finiteNumber(pt.current);
+}
+
+/**
+ * Clean a sweep and average repeated samples at the exact same voltage.
+ * Repeated setpoints are common in exported instrument data; averaging makes
+ * extraction deterministic while the returned duplicate count ensures the
+ * operation is never silent.
+ */
+function normalizeSweep(pts) {
+  const raw = pts
+    .map((p) => ({ v: finiteNumber(p && p.voltage), i: signedCurrent(p) }))
+    .filter((p) => Number.isFinite(p.v) && Number.isFinite(p.i))
+    .sort((a, b) => a.v - b.v);
+  const clean = [];
+  for (const point of raw) {
+    const last = clean[clean.length - 1];
+    if (last && last.v === point.v) {
+      last.sum += point.i;
+      last.count++;
+      last.i = last.sum / last.count;
+    } else {
+      clean.push({ v: point.v, i: point.i, sum: point.i, count: 1 });
+    }
+  }
+  return {
+    clean: clean.map(({ v, i }) => ({ v, i })),
+    rawCount: raw.length,
+    duplicateCount: raw.length - clean.length,
+  };
+}
+
+function medianPositiveStep(values) {
+  const steps = [];
+  for (let k = 1; k < values.length; k++) {
+    const step = values[k] - values[k - 1];
+    if (step > 0) steps.push(step);
+  }
+  if (!steps.length) return 0;
+  steps.sort((a, b) => a - b);
+  const mid = Math.floor(steps.length / 2);
+  return steps.length % 2 ? steps[mid] : (steps[mid - 1] + steps[mid]) / 2;
+}
+
+/**
+ * Fit I(V) locally around a target voltage. At most seven nearest samples are
+ * used so distant reverse-bias or knee data cannot dominate an endpoint slope.
+ */
+function localCurrentFit(v, i, target, characteristicSpan) {
+  const step = medianPositiveStep(v);
+  const radius = Math.max(characteristicSpan, 3 * step);
+  let indices = v
+    .map((value, index) => ({ index, distance: Math.abs(value - target) }))
+    .filter((entry) => entry.distance <= radius + Number.EPSILON)
+    .sort((a, b) => a.distance - b.distance);
+  if (indices.length < 3) {
+    indices = v
+      .map((value, index) => ({ index, distance: Math.abs(value - target) }))
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, 3);
+  } else {
+    indices = indices.slice(0, 7);
+  }
+  indices.sort((a, b) => v[a.index] - v[b.index]);
+  const xs = indices.map((entry) => v[entry.index]);
+  const ys = indices.map((entry) => i[entry.index]);
+  const result = linearFit(xs, ys);
+  return result ? { ...result, voltageSpan: xs[xs.length - 1] - xs[0] } : null;
 }
 
 /**
@@ -57,38 +148,51 @@ function signedCurrent(pt) {
  * @param {Array<{voltage:number, current?:number, rawCurrent?:number}>} pts
  *   Measured points. Order does not matter — points are sorted by voltage.
  * @returns {null | {
- *   isc:number, voc:number, pmax:number, vmp:number, imp:number,
- *   ff:number, rs:number, rsh:number, crossIndex:number,
- *   notes:{ iscExtrapolated:boolean, vocBeyondRange:boolean },
- *   warnings:string[]
- * }}  All electrical quantities in SI base units (V, A, W, Ω). `ff` is a
- *   fraction in [0,1]. `warnings` lists human-readable data-quality flags
- *   (empty for a clean sweep). Returns null when fewer than 3 valid points
- *   are given.
+ *   isc:number, voc:number|null, pmax:number, vmp:number, imp:number,
+ *   ff:number|null, rs:number|null, rsh:number|null, crossIndex:number,
+ *   notes:{ iscExtrapolated:boolean, vocBeyondRange:boolean, vocAmbiguous:boolean, duplicateVoltages:number },
+ *   status:Record<string,string>, warnings:string[], errors:string[],
+ *   quality:"pass"|"review"|"invalid"
+ * }}  Electrical quantities use SI base units (V, A, W, Ω). `ff` is a
+ *   dimensionless fraction when identifiable. Status fields distinguish
+ *   measured, interpolated, extrapolated, provisional, and withheld results.
+ *   Returns null when fewer than 3 finite, unique-voltage samples remain.
  */
 export function calcMetrics(pts) {
   if (!Array.isArray(pts) || pts.length < 3) return null;
 
-  // Build clean, voltage-sorted arrays of finite samples.
-  const clean = pts
-    .map((p) => ({ v: Number(p.voltage), i: signedCurrent(p) }))
-    .filter((p) => Number.isFinite(p.v) && Number.isFinite(p.i))
-    .sort((a, b) => a.v - b.v);
+  // Build clean, voltage-sorted arrays of finite, unique-voltage samples.
+  const normalized = normalizeSweep(pts);
+  const clean = normalized.clean;
   const n = clean.length;
   if (n < 3) return null;
 
   const v = clean.map((p) => p.v);
   const i = clean.map((p) => p.i);
 
-  const notes = { iscExtrapolated: false, vocBeyondRange: false };
+  const notes = {
+    iscExtrapolated: false,
+    vocBeyondRange: false,
+    vocAmbiguous: false,
+    duplicateVoltages: normalized.duplicateCount,
+  };
+  const status = {
+    isc: "unavailable",
+    voc: "unavailable",
+    pmax: "unavailable",
+    ff: "unavailable",
+    rs: "unavailable",
+    rsh: "unavailable",
+  };
 
   // ── Short-circuit current Isc = I(V = 0) ─────────────────────────────────
   // Prefer an exact V=0 sample, else interpolate across the bracketing pair,
-  // else linearly extrapolate from the two lowest-voltage points to V=0.
+  // else linearly extrapolate from the two samples nearest V=0.
   let isc;
   const zeroExact = v.indexOf(0);
   if (zeroExact !== -1) {
     isc = i[zeroExact];
+    status.isc = "measured";
   } else {
     let bracket = -1;
     for (let j = 0; j < n - 1; j++) {
@@ -99,28 +203,51 @@ export function calcMetrics(pts) {
     }
     if (bracket !== -1) {
       isc = lerp(0, v[bracket], i[bracket], v[bracket + 1], i[bracket + 1]);
+      status.isc = "interpolated";
     } else {
-      // All samples on one side of V=0: extrapolate from the nearest two.
-      isc = lerp(0, v[0], i[0], v[1], i[1]);
+      const nearest = clean
+        .map((point) => ({ ...point, distance: Math.abs(point.v) }))
+        .sort((a, b) => a.distance - b.distance)
+        .slice(0, 2)
+        .sort((a, b) => a.v - b.v);
+      isc = lerp(0, nearest[0].v, nearest[0].i, nearest[1].v, nearest[1].i);
       notes.iscExtrapolated = true;
+      status.isc = "extrapolated";
     }
   }
 
   // ── Open-circuit voltage Voc = V where I first crosses 0 going negative ───
   let voc = null;
   let crossIndex = -1;
+  const vocCandidates = [];
   for (let j = 1; j < n; j++) {
     if (i[j - 1] > 0 && i[j] <= 0) {
-      voc = lerp(0, i[j - 1], v[j - 1], i[j], v[j]); // interpolate V at I=0
-      crossIndex = j;
-      break;
+      const candidate = lerp(0, i[j - 1], v[j - 1], i[j], v[j]);
+      if (candidate >= 0) {
+        vocCandidates.push({
+          voltage: candidate,
+          index: j,
+          status: i[j] === 0 ? "measured" : "interpolated",
+        });
+      }
     }
   }
-  if (voc === null) {
-    // Current never reaches zero within the sweep — report the last voltage
-    // and flag that Voc lies beyond the measured range.
-    voc = v[n - 1];
-    notes.vocBeyondRange = true;
+  if (vocCandidates.length === 1) {
+    voc = vocCandidates[0].voltage;
+    crossIndex = vocCandidates[0].index;
+    status.voc = vocCandidates[0].status;
+  } else if (vocCandidates.length > 1) {
+    notes.vocAmbiguous = true;
+    status.voc = "ambiguous";
+  } else {
+    const nonnegative = clean.filter((point) => point.v >= 0);
+    if (nonnegative.some((point) => point.i > 0)) {
+      // Keep the boundary value for charting/backward compatibility, but mark
+      // it explicitly as a lower bound and do not derive FF or Rs from it.
+      voc = nonnegative[nonnegative.length - 1].v;
+      notes.vocBeyondRange = true;
+      status.voc = "lower-bound";
+    }
   }
 
   // ── Maximum power point — restricted to the power quadrant (V≥0, I≥0) ─────
@@ -134,61 +261,96 @@ export function calcMetrics(pts) {
   let pmax = 0;
   let vmp = 0;
   let imp = 0;
-  const considerMpp = (vv, ii) => {
-    if (vv < 0 || ii < 0) return;
+  let mppSource = "unavailable";
+  let mppOverflow = false;
+  const considerMpp = (vv, ii, source) => {
+    if (vv < 0 || ii < 0 || (voc != null && status.voc !== "lower-bound" && vv > voc + 1e-12)) return;
     const p = vv * ii;
-    if (p > pmax) { pmax = p; vmp = vv; imp = ii; }
+    if (!Number.isFinite(p)) { mppOverflow = true; return; }
+    if (p > pmax) { pmax = p; vmp = vv; imp = ii; mppSource = source; }
   };
-  for (let j = 0; j < n; j++) considerMpp(v[j], i[j]);
+  for (let j = 0; j < n; j++) considerMpp(v[j], i[j], "measured");
   for (let j = 0; j < n - 1; j++) {
     const dv = v[j + 1] - v[j];
-    if (dv <= 0) continue; // duplicate abscissa — no interior to search
+    if (dv <= 0) continue;
     const b = (i[j + 1] - i[j]) / dv;
     if (b >= 0) continue; // parabola opens upward or is flat: endpoints suffice
     const a = i[j] - b * v[j];
     const vStar = -a / (2 * b);
-    if (vStar > v[j] && vStar < v[j + 1]) considerMpp(vStar, a + b * vStar);
+    if (vStar > v[j] && vStar < v[j + 1]) considerMpp(vStar, a + b * vStar, "interpolated");
   }
+  if (pmax > 0) status.pmax = status.voc === "lower-bound" ? "provisional" : mppSource;
 
   // ── Fill factor FF = Pmax / (Isc · Voc) ──────────────────────────────────
   // Uses the Pmax actually found on the P-V curve above — never the
   // Voc·Isc·(assumed FF) shortcut.
-  const ff = isc > 0 && voc > 0 ? pmax / (isc * voc) : 0;
-
-  // ── Series resistance Rs ≈ −dV/dI at the I = 0 crossing (near Voc) ────────
-  // Slope of the single segment that brackets the crossing — the most local
-  // estimate available from one light sweep.
-  let rs = 0;
-  if (crossIndex >= 1) {
-    const dv = v[crossIndex] - v[crossIndex - 1];
-    const di = i[crossIndex] - i[crossIndex - 1];
-    if (di !== 0) rs = Math.abs(dv / di);
+  let ff = null;
+  if (isc > 0 && voc > 0 && (status.voc === "measured" || status.voc === "interpolated")) {
+    ff = pmax / (isc * voc);
+    status.ff = status.isc === "extrapolated" ? "provisional" : "computed";
   }
 
-  // ── Shunt resistance Rsh ≈ (dI/dV)⁻¹ near short circuit ──────────────────
-  // Least-squares slope of I(V) over the low-voltage plateau (V ≤ 30 % of Voc,
-  // including any reverse-bias samples) — more noise-robust than a two-point
-  // difference. Falls back to the three lowest-voltage samples when the
-  // plateau holds fewer than three points.
-  let rsh = Infinity;
-  {
-    const cut = voc > 0 ? 0.3 * voc : v[0] + 0.3 * (v[n - 1] - v[0]);
-    let xs = [], ys = [];
-    for (let j = 0; j < n; j++) if (v[j] <= cut) { xs.push(v[j]); ys.push(i[j]); }
-    if (xs.length < 3) { xs = v.slice(0, 3); ys = i.slice(0, 3); }
-    const slope = lsqSlope(xs, ys);
-    if (slope !== null && slope !== 0) rsh = Math.abs(1 / slope);
+  // ── Endpoint resistance estimates ─────────────────────────────────────────
+  // Fit the nearest local samples rather than using one noise-sensitive pair.
+  // These remain slope estimates from a light sweep, not single-diode fits.
+  let rs = null;
+  let rsFit = null;
+  if (voc != null && (status.voc === "measured" || status.voc === "interpolated")) {
+    rsFit = localCurrentFit(v, i, voc, 0.08 * Math.max(voc, medianPositiveStep(v)));
+    if (rsFit && rsFit.slope !== 0) {
+      const estimate = Math.abs(1 / rsFit.slope);
+      if (Number.isFinite(estimate)) {
+        rs = estimate;
+        status.rs = "estimated";
+      }
+    }
+  }
+
+  let rsh = null;
+  const rshFit = localCurrentFit(
+    v,
+    i,
+    0,
+    0.08 * Math.max(voc || (v[n - 1] - v[0]), medianPositiveStep(v))
+  );
+  if (rshFit) {
+    rsh = rshFit.slope === 0 ? Infinity : Math.abs(1 / rshFit.slope);
+    status.rsh = status.isc === "extrapolated" ? "provisional" : "estimated";
   }
 
   // ── Data-quality warnings ─────────────────────────────────────────────────
   // Sanity checks a reviewer would run by eye; surfaced verbatim in the UI.
   const warnings = [];
+  const errors = [];
+  if (normalized.duplicateCount > 0)
+    warnings.push(`${normalized.duplicateCount} repeated voltage sample(s) were averaged before extraction — split forward/reverse sweeps into separate channels if these repeats represent hysteresis.`);
   if (notes.iscExtrapolated)
-    warnings.push("No samples bracket V = 0 — Isc is a linear extrapolation from the two lowest-voltage points.");
+    warnings.push("No samples bracket V = 0 — Isc is a linear extrapolation from the two nearest voltage points.");
   if (notes.vocBeyondRange)
-    warnings.push("Current never crosses zero within the sweep — the quoted Voc is the last measured voltage (a lower bound).");
+    warnings.push("Current never crosses zero within the sweep — Voc is reported only as a lower bound; FF and Rs are withheld and Pmax is provisional.");
+  if (notes.vocAmbiguous)
+    errors.push(`Current crosses from positive to non-positive ${vocCandidates.length} times at non-negative voltage — Voc is ambiguous, so Voc, FF, and Rs are withheld.`);
+  if (!Number.isFinite(isc))
+    errors.push("Isc calculation overflowed or became non-finite — inspect extreme values, units, and corrupt cells.");
+  if (mppOverflow) {
+    status.pmax = "overflow";
+    errors.push("At least one V·I product overflowed the numeric range — power metrics are not reportable; inspect extreme values and units.");
+  }
+  if (ff != null && !Number.isFinite(ff)) {
+    status.ff = "unavailable";
+    errors.push("Fill-factor calculation became non-finite — power metrics are not reportable; inspect extreme values and units.");
+    ff = null;
+  }
   if (isc <= 0)
-    warnings.push("Isc ≤ 0. For an illuminated cell in generator convention Isc should be positive — check the current sign or column mapping.");
+    errors.push("Isc ≤ 0. Solavin requires generator convention (positive current in the power quadrant); invert the current sign or correct the column mapping.");
+  if (!v.some((value) => value >= 0))
+    errors.push("The sweep contains no non-negative voltage samples, so photovoltaic power-quadrant metrics are not identifiable.");
+  if (voc === null && !notes.vocAmbiguous)
+    errors.push("No non-negative open-circuit crossing or lower bound can be identified from this sweep.");
+  if (ff != null && (ff < 0 || ff > 1 + 1e-9)) {
+    status.ff = "unphysical";
+    errors.push(`Computed fill factor is ${(ff * 100).toFixed(2)} %, outside the physical 0–100 % interval — inspect sign convention, sweep coverage, and outliers.`);
+  }
   // Monotonicity: between V = 0 and Voc an illuminated cell's current should
   // fall as voltage rises. Tolerate noise up to 2 % of the Isc scale.
   {
@@ -196,7 +358,8 @@ export function calcMetrics(pts) {
     const tol = 0.02 * scale;
     let rises = 0;
     for (let j = 1; j < n; j++) {
-      if (v[j - 1] < 0 || v[j] > voc + 1e-12) continue;
+      const limit = voc == null ? v[n - 1] : voc;
+      if (v[j - 1] < 0 || v[j] > limit + 1e-12) continue;
       if (i[j] - i[j - 1] > tol) rises++;
     }
     if (rises > 0)
@@ -210,7 +373,18 @@ export function calcMetrics(pts) {
       warnings.push(`Only ${quad} sweep point(s) fall in the power quadrant (V ≥ 0, I ≥ 0) — Vmp/Imp resolution is limited; use a finer voltage step.`);
   }
 
-  return { isc, voc, pmax, vmp, imp, ff, rs, rsh, crossIndex, notes, warnings };
+  const quality = errors.length ? "invalid" : warnings.length ? "review" : "pass";
+  return {
+    isc, voc, pmax, vmp, imp, ff, rs, rsh, crossIndex,
+    sampleCount: normalized.rawCount,
+    uniqueVoltageCount: n,
+    notes,
+    status,
+    fit: { rs: rsFit, rsh: rshFit },
+    warnings,
+    errors,
+    quality,
+  };
 }
 
 /**
@@ -247,11 +421,15 @@ export function fmtSI(value, unit, digits = 3) {
  * @returns {number|null} Efficiency in percent, or null for invalid inputs.
  */
 export function computeEfficiency(pmaxW, areaCm2, irradiance) {
+  const p = Number(pmaxW);
   const a = Number(areaCm2);
   const g = Number(irradiance);
-  if (!Number.isFinite(a) || !Number.isFinite(g) || a <= 0 || g <= 0) return null;
+  if (!Number.isFinite(p) || !Number.isFinite(a) || !Number.isFinite(g) || p < 0 || a <= 0 || g <= 0) return null;
   const areaM2 = a * 1e-4; // cm² → m²
-  return (pmaxW / (g * areaM2)) * 100;
+  const incidentPower = g * areaM2;
+  if (!Number.isFinite(incidentPower) || incidentPower <= 0) return null;
+  const efficiency = (p / incidentPower) * 100;
+  return Number.isFinite(efficiency) ? efficiency : null;
 }
 
 /**
@@ -259,28 +437,185 @@ export function computeEfficiency(pmaxW, areaCm2, irradiance) {
  * sweeps, row 0 = headers) into a structured dataset fragment.
  *
  * @param {Array<Array<*>>} rows
- * @returns {null | { conditions:string[], ivData:Record<string, Array> }}
+ * Missing/blank cells are skipped, never coerced to zero. Header names are
+ * made unique so one channel cannot silently overwrite another.
+ *
+ * @returns {null | {
+ *   conditions:string[],
+ *   ivData:Record<string, Array>,
+ *   diagnostics:{warnings:string[], rows:number, channels:Record<string, object>}
+ * }}
  */
 export function extractIV(rows) {
-  if (!rows || rows.length < 3) return null;
-  const header = rows[0]
-    .slice(1)
-    .map((x, idx) => (x == null || x === "" ? `Channel ${idx + 1}` : String(x)));
-  const conditions = header.filter((_, idx) => rows[0][idx + 1] != null && rows[0][idx + 1] !== "");
-  if (conditions.length === 0) return null;
+  if (!Array.isArray(rows) || rows.length < 2 || !Array.isArray(rows[0])) return null;
+  if (rows.length - 1 > MAX_WORKSHEET_ROWS)
+    throw new Error(`Worksheet exceeds the ${MAX_WORKSHEET_ROWS.toLocaleString()}-data-row safety limit.`);
+  const dataRows = rows.slice(1).filter(Array.isArray);
+  const maxColumns = rows.reduce((max, row) => (Array.isArray(row) ? Math.max(max, row.length) : max), 0);
+  if (maxColumns < 2) return null;
+  if (maxColumns > MAX_WORKSHEET_COLUMNS)
+    throw new Error(`Worksheet exceeds the ${MAX_WORKSHEET_COLUMNS.toLocaleString()}-column safety limit.`);
 
-  const dataRows = rows.slice(1).filter((r) => r[0] != null && r[0] !== "");
-  const ivData = {};
-  conditions.forEach((name, ci) => {
-    ivData[name] = dataRows
-      .map((r) => {
-        const voltage = Number(r[0]);
-        const raw = Number(r[ci + 1] ?? 0);
-        return { voltage, current: Math.abs(raw), rawCurrent: raw };
-      })
-      .filter((p) => Number.isFinite(p.voltage) && Number.isFinite(p.rawCurrent));
-  });
-  return { conditions, ivData };
+  const warnings = [];
+  const channels = Object.create(null);
+  const ivData = Object.create(null);
+  const conditions = [];
+  const nameCounts = new Map();
+  let invalidVoltageRows = 0;
+  for (const row of dataRows) {
+    if (!Number.isFinite(finiteNumber(row[0]))) invalidVoltageRows++;
+  }
+
+  const uniqueName = (raw, columnIndex) => {
+    let base = raw == null || String(raw).trim() === ""
+      ? `Channel ${columnIndex}`
+      : String(raw).trim().slice(0, 120);
+    if (["__proto__", "prototype", "constructor"].includes(base)) base = `Channel: ${base}`;
+    const count = (nameCounts.get(base) || 0) + 1;
+    nameCounts.set(base, count);
+    return count === 1 ? base : `${base} (${count})`;
+  };
+
+  for (let columnIndex = 1; columnIndex < maxColumns; columnIndex++) {
+    const hasHeader = rows[0][columnIndex] != null && String(rows[0][columnIndex]).trim() !== "";
+    const hasAnyCell = dataRows.some((row) => row[columnIndex] != null && String(row[columnIndex]).trim() !== "");
+    if (!hasHeader && !hasAnyCell) continue;
+
+    const name = uniqueName(rows[0][columnIndex], columnIndex);
+    const points = [];
+    let skippedCurrent = 0;
+    for (const row of dataRows) {
+      const voltage = finiteNumber(row[0]);
+      const current = finiteNumber(row[columnIndex]);
+      if (!Number.isFinite(voltage)) continue;
+      if (!Number.isFinite(current)) {
+        skippedCurrent++;
+        continue;
+      }
+      points.push({ voltage, current: Math.abs(current), rawCurrent: current });
+    }
+
+    const uniqueVoltages = new Set(points.map((point) => point.voltage)).size;
+    if (points.length < 3 || uniqueVoltages < 3) {
+      warnings.push(`Column ${columnIndex + 1} (${name}) was ignored because it contains ${points.length} valid pair(s) across ${uniqueVoltages} unique voltage(s); at least 3 unique voltages are required.`);
+      continue;
+    }
+    if (!hasHeader) warnings.push(`Column ${columnIndex + 1} had no header and was named "${name}".`);
+    if (nameCounts.get(String(rows[0][columnIndex] ?? "").trim()) > 1)
+      warnings.push(`Duplicate channel header "${String(rows[0][columnIndex]).trim()}" was renamed "${name}".`);
+    if (skippedCurrent > 0)
+      warnings.push(`${name}: skipped ${skippedCurrent} row(s) with a blank or non-numeric current; no zero values were inserted.`);
+
+    conditions.push(name);
+    ivData[name] = points;
+    channels[name] = {
+      column: columnIndex + 1,
+      validPoints: points.length,
+      uniqueVoltages,
+      skippedCurrent,
+    };
+  }
+  if (conditions.length === 0) return null;
+  if (invalidVoltageRows > 0)
+    warnings.push(`Skipped ${invalidVoltageRows} row(s) with a blank or non-numeric voltage.`);
+
+  return {
+    conditions,
+    ivData,
+    diagnostics: {
+      warnings,
+      rows: dataRows.length,
+      invalidVoltageRows,
+      channels,
+    },
+  };
+}
+
+/**
+ * Parse RFC 4180-style CSV text without executing formulas or coercing values.
+ * Numeric conversion happens later in extractIV().
+ */
+export function parseCsv(text, limits = {}) {
+  if (typeof text !== "string") throw new TypeError("CSV input must be text.");
+  const maxRows = limits.maxRows || 250000;
+  const maxColumns = limits.maxColumns || 2048;
+  const source = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  const rows = [];
+  let row = [];
+  let field = "";
+  let quoted = false;
+
+  const pushField = () => {
+    row.push(field);
+    field = "";
+    if (row.length > maxColumns) throw new Error(`CSV exceeds the ${maxColumns}-column safety limit.`);
+  };
+  const pushRow = () => {
+    pushField();
+    rows.push(row);
+    row = [];
+    if (rows.length > maxRows) throw new Error(`CSV exceeds the ${maxRows.toLocaleString()}-row safety limit.`);
+  };
+
+  for (let index = 0; index < source.length; index++) {
+    const char = source[index];
+    if (quoted) {
+      if (char === '"') {
+        if (source[index + 1] === '"') {
+          field += '"';
+          index++;
+        } else {
+          quoted = false;
+        }
+      } else {
+        field += char;
+      }
+      continue;
+    }
+    if (char === '"' && field === "") {
+      quoted = true;
+    } else if (char === ",") {
+      pushField();
+    } else if (char === "\n" || char === "\r") {
+      if (char === "\r" && source[index + 1] === "\n") index++;
+      pushRow();
+    } else {
+      field += char;
+    }
+  }
+  if (quoted) throw new Error("CSV contains an unterminated quoted field.");
+  if (field !== "" || row.length > 0) pushRow();
+  while (rows.length && rows[rows.length - 1].every((cell) => cell === "")) rows.pop();
+  return rows;
+}
+
+/**
+ * Align channels by numeric voltage rather than array index. Sparse channels
+ * retain null gaps, preventing a missing cell from shifting every later point
+ * onto the wrong x-coordinate.
+ */
+export function buildAlignedRows(dataset, selectedConditions, valueForPoint = (point) => point.rawCurrent) {
+  if (!dataset || !Array.isArray(dataset.conditions) || !dataset.ivData) return [];
+  const conditions = Array.isArray(selectedConditions) ? selectedConditions : dataset.conditions;
+  const rowsByVoltage = new Map();
+  for (const condition of conditions) {
+    const samplesByVoltage = new Map();
+    for (const point of dataset.ivData[condition] || []) {
+      const voltage = finiteNumber(point && point.voltage);
+      const value = valueForPoint(point, condition);
+      if (!Number.isFinite(voltage) || !Number.isFinite(value)) continue;
+      const group = samplesByVoltage.get(voltage) || { sum: 0, count: 0 };
+      group.sum += value;
+      group.count++;
+      samplesByVoltage.set(voltage, group);
+    }
+    for (const [voltage, group] of samplesByVoltage) {
+      const row = rowsByVoltage.get(voltage) || { voltage };
+      row[condition] = group.sum / group.count;
+      rowsByVoltage.set(voltage, row);
+    }
+  }
+  return [...rowsByVoltage.values()].sort((a, b) => a.voltage - b.voltage);
 }
 
 /**
@@ -327,7 +662,12 @@ export function buildSampleDataset() {
       rawCurrent: r[ci + 1],
     }));
   });
-  return { name: "Sample: Solar Cell (Room Lights)", conditions, ivData };
+  return {
+    name: "Sample: Solar Cell (Room Lights)",
+    conditions,
+    ivData,
+    source: { file: "examples/sample_iv_data.csv", sheet: "CSV" },
+  };
 }
 
 /**
@@ -340,12 +680,13 @@ export function buildSampleDataset() {
  * @param {{conditions:string[]}} dataset
  * @param {Record<string, ReturnType<typeof calcMetrics>>} allMetrics
  * @param {Record<string, number>|null} [efficiency]  optional η (%) per condition
+ * @param {{cellAreaCm2?:number, irradianceWm2?:number}} [efficiencyInputs]
  */
-export function metricsToRows(dataset, allMetrics, efficiency) {
+export function metricsToRows(dataset, allMetrics, efficiency, efficiencyInputs = {}) {
   const ms = dataset.conditions.map((c) => allMetrics[c]).filter(Boolean);
   const iScale = siPrefix(Math.max(0, ...ms.map((m) => Math.abs(m.isc)), ...ms.map((m) => Math.abs(m.imp))));
   const pScale = siPrefix(Math.max(0, ...ms.map((m) => Math.abs(m.pmax))));
-  const rsScale = siPrefix(Math.max(0, ...ms.map((m) => Math.abs(m.rs))));
+  const rsScale = siPrefix(Math.max(0, ...ms.filter((m) => Number.isFinite(m.rs)).map((m) => Math.abs(m.rs))));
   const rshScale = siPrefix(Math.max(0, ...ms.filter((m) => Number.isFinite(m.rsh)).map((m) => Math.abs(m.rsh))));
   const ascii = (p) => (p === "µ" ? "u" : p);
   const header = [
@@ -359,26 +700,110 @@ export function metricsToRows(dataset, allMetrics, efficiency) {
     `Rs (${ascii(rsScale.prefix)}Ohm)`,
     `Rsh (${ascii(rshScale.prefix)}Ohm)`,
   ];
-  if (efficiency) header.push("Efficiency (%)");
+  if (efficiency) header.push(
+    "Efficiency (%)",
+    "Efficiency status",
+    "Cell area (cm2)",
+    "Irradiance (W/m2)"
+  );
+  header.push(
+    "Isc status",
+    "Voc status",
+    "Pmax status",
+    "FF status",
+    "Quality",
+    "Valid samples",
+    "Unique voltages",
+    "Metric flags",
+    "Import flags",
+    "Source file",
+    "Source sheet",
+    "Analysis version",
+    "Analysis method"
+  );
+  const importFlags = (dataset.diagnostics?.warnings || []).join(" | ");
   const rows = [header];
   dataset.conditions.forEach((c) => {
     const m = allMetrics[c];
     if (!m) return;
+    const efficiencyValue = efficiency?.[c];
+    const hasEfficiency = Number.isFinite(efficiencyValue);
+    const metricFlags = [...(m.errors || []), ...(m.warnings || [])];
+    const hasPmax = ["measured", "interpolated", "provisional"].includes(m.status?.pmax);
+    if (Number.isFinite(efficiencyValue) && efficiencyValue > 100)
+      metricFlags.push(`Computed efficiency is ${efficiencyValue.toPrecision(4)} %, above the physical 100 % limit — verify area, irradiance, units, and measurement conditions.`);
     const row = [
       c,
-      +(m.isc / iScale.div).toFixed(4),
-      +m.voc.toFixed(4),
-      +(m.pmax / pScale.div).toFixed(4),
-      +m.vmp.toFixed(4),
-      +(m.imp / iScale.div).toFixed(4),
-      +(m.ff * 100).toFixed(2),
-      +(m.rs / rsScale.div).toFixed(3),
-      m.rsh === Infinity ? "Inf" : +(m.rsh / rshScale.div).toFixed(3),
+      Number.isFinite(m.isc) ? +(m.isc / iScale.div).toFixed(4) : "",
+      Number.isFinite(m.voc) ? +m.voc.toFixed(4) : "",
+      hasPmax ? +(m.pmax / pScale.div).toFixed(4) : "",
+      hasPmax ? +m.vmp.toFixed(4) : "",
+      hasPmax ? +(m.imp / iScale.div).toFixed(4) : "",
+      m.ff == null ? "" : +(m.ff * 100).toFixed(2),
+      m.rs == null ? "" : +(m.rs / rsScale.div).toFixed(3),
+      m.rsh == null ? "" : m.rsh === Infinity ? "Inf" : +(m.rsh / rshScale.div).toFixed(3),
     ];
-    if (efficiency) row.push(efficiency[c] != null ? +efficiency[c].toPrecision(4) : "");
+    if (efficiency) row.push(
+      hasEfficiency ? +efficiencyValue.toPrecision(4) : "",
+      !hasEfficiency ? "" : efficiencyValue > 100 ? "unphysical" : "computed",
+      Number.isFinite(efficiencyInputs.cellAreaCm2) ? efficiencyInputs.cellAreaCm2 : "",
+      Number.isFinite(efficiencyInputs.irradianceWm2) ? efficiencyInputs.irradianceWm2 : ""
+    );
+    row.push(
+      m.status?.isc || "",
+      m.status?.voc || "",
+      m.status?.pmax || "",
+      m.status?.ff || "",
+      m.quality || "",
+      m.sampleCount ?? "",
+      m.uniqueVoltageCount ?? "",
+      metricFlags.join(" | "),
+      importFlags,
+      dataset.source?.file || "",
+      dataset.source?.sheet || "",
+      ANALYSIS_VERSION,
+      ANALYSIS_METHOD
+    );
     rows.push(row);
   });
   return rows;
+}
+
+/**
+ * Export the signed measurements exactly as aligned for visualization.
+ * Missing samples remain blank; duplicate exact-voltage samples are averaged
+ * consistently with buildAlignedRows().
+ */
+export function rawDataToRows(dataset) {
+  if (!dataset || !Array.isArray(dataset.conditions)) return [["Voltage (V)"]];
+  const header = ["Voltage (V)", ...dataset.conditions.map((condition) => `${condition} (A)`)];
+  const body = buildAlignedRows(dataset).map((aligned) => [
+    aligned.voltage,
+    ...dataset.conditions.map((condition) =>
+      Number.isFinite(aligned[condition]) ? aligned[condition] : ""
+    ),
+  ]);
+  return [header, ...body];
+}
+
+/** Export analysis provenance and interpretation rules as a two-column sheet. */
+export function metadataToRows(dataset, efficiencyInputs = {}) {
+  return [
+    ["Field", "Value"],
+    ["Solavin analysis version", ANALYSIS_VERSION],
+    ["Analysis method", ANALYSIS_METHOD],
+    ["Dataset", dataset?.name || ""],
+    ["Source file", dataset?.source?.file || ""],
+    ["Source sheet", dataset?.source?.sheet || ""],
+    ["Cell area (cm2)", Number.isFinite(efficiencyInputs.cellAreaCm2) ? efficiencyInputs.cellAreaCm2 : ""],
+    ["Irradiance (W/m2)", Number.isFinite(efficiencyInputs.irradianceWm2) ? efficiencyInputs.irradianceWm2 : ""],
+    ["Current convention", "Generator convention: positive current produces positive V*I power"],
+    ["Visualization", "Measured samples joined with straight segments; no smoothing"],
+    ["Duplicate voltage handling", "Exact duplicate setpoints are averaged and reported"],
+    ["Missing cell handling", "Missing or non-numeric measurements stay missing; zeros are never inserted"],
+    ["Censored sweep handling", "When Voc is not bracketed, Voc is a lower bound, Pmax is provisional, and FF/Rs are withheld"],
+    ["Import flags", (dataset?.diagnostics?.warnings || []).join(" | ")],
+  ];
 }
 
 /** Serialise export rows to a CSV string. */
@@ -387,7 +812,10 @@ export function rowsToCsv(rows) {
     .map((r) =>
       r
         .map((cell) => {
-          const s = String(cell);
+          // Prevent spreadsheet formula injection through untrusted channel
+          // labels while leaving numeric negative values numeric.
+          const safe = typeof cell === "string" && /^[=+\-@\t\r]/.test(cell) ? `'${cell}` : cell;
+          const s = String(safe);
           return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
         })
         .join(",")

@@ -118,7 +118,7 @@ export function Welcome({ t, onClose, onStartTour }) {
             <div style={{ borderRadius: 12, border: "1px solid " + t.border, padding: "14px 16px", background: t.cardAlt }}>
               <div className="mono" style={{ ...kicker, marginBottom: 10 }}>WHAT YOU PROVIDE</div>
               <div style={{ fontSize: 11, color: t.textM, lineHeight: 1.6, marginBottom: 10 }}>
-                An <strong style={{ color: t.text }}>.xlsx, .xls or .csv</strong> workbook — one voltage column, any number of current sweeps. Header row becomes channel labels.
+                An <strong style={{ color: t.text }}>.xlsx or .csv</strong> workbook — one voltage column, any number of signed-current sweeps. Header row becomes channel labels; legacy .xls is intentionally rejected.
               </div>
               <table className="mono" style={{ width: "100%", borderCollapse: "collapse", fontSize: 9.5 }}>
                 <thead><tr>{["COL", "CONTENT", "UNIT"].map((h) => <th key={h} style={{ textAlign: "left", color: t.textD, fontSize: 8, letterSpacing: ".1em", padding: "4px 6px", borderBottom: "1px solid " + t.border }}>{h}</th>)}</tr></thead>

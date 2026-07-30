@@ -100,7 +100,7 @@ export function TourOverlay(p) {
                 <div className="mono" style={{ fontSize: 8, color: t.textD, letterSpacing: ".12em", marginTop: 1 }}>GUIDED WALKTHROUGH</div>
               </div>
             </div>
-            <button onClick={p.onSkip} className="mono" style={{ fontSize: 9, color: t.textD, background: "none", border: "1px solid " + t.border, borderRadius: 5, padding: "3px 8px", letterSpacing: ".06em" }}>SKIP ✕</button>
+            <button aria-label="Dismiss guided tour" onClick={p.onSkip} className="mono" style={{ fontSize: 9, color: t.textD, background: "none", border: "1px solid " + t.border, borderRadius: 5, padding: "3px 8px", letterSpacing: ".06em" }}>SKIP ✕</button>
           </div>
           <h3 style={{ fontSize: 18, fontWeight: 700, marginBottom: 8, letterSpacing: "-.025em", lineHeight: 1.2 }}>{step.title}</h3>
           <p style={{ fontSize: 11.5, color: t.textM, lineHeight: 1.65, marginBottom: 18 }}>{step.desc}</p>
