@@ -135,19 +135,22 @@ try {
     buffer: Buffer.from(sparseCsv),
   });
   await page.getByText("sparse_iv (CSV)", { exact: false }).first().waitFor();
-  const sparseAlignmentOk = await page.evaluate(() => {
-    const table = [...document.querySelectorAll("table")].find((candidate) =>
-      candidate.innerText.includes("Cell A") && candidate.innerText.includes("Cell B")
-    );
-    if (!table) return false;
+  const rawDataTable = page.getByRole("table", { name: "Raw I-V measurements", exact: true });
+  await rawDataTable.waitFor();
+  await rawDataTable.getByRole("columnheader", { name: "Cell A", exact: true }).waitFor();
+  const sparseAlignment = await rawDataTable.evaluate((table) => {
     const rows = [...table.querySelectorAll("tbody tr")].map((row) =>
       [...row.querySelectorAll("td")].map((cell) => cell.innerText.trim())
     );
     const atHalfVolt = rows.find((row) => row[0] === "0.50");
     const atOneVolt = rows.find((row) => row[0] === "1.00");
-    return atHalfVolt?.[1] === "—" && atHalfVolt?.[2] === "1.500e+0" &&
-      atOneVolt?.[1] === "5.000e-1" && atOneVolt?.[2] === "—";
+    return {
+      ok: atHalfVolt?.[1] === "—" && atHalfVolt?.[2] === "1.500e+0" &&
+        atOneVolt?.[1] === "5.000e-1" && atOneVolt?.[2] === "—",
+      rows,
+    };
   });
+  const sparseAlignmentOk = sparseAlignment.ok;
   await page.getByRole("button", { name: "Metrics & Export", exact: true }).click();
   await page.getByText(/skipped 1 row\(s\).*no zero values were inserted/i).first().waitFor();
 
@@ -207,7 +210,7 @@ try {
   if (!hasEff) fail.push("efficiency column missing");
   if (!assistantOk) fail.push("assistant did not answer fill-factor query");
   if (!chartIntegrity) fail.push("chart SVG paths were missing or contained NaN/Infinity");
-  if (!sparseAlignmentOk) fail.push("sparse channels were not preserved at their correct voltages");
+  if (!sparseAlignmentOk) fail.push("sparse channels were not preserved at their correct voltages; observed rows: " + JSON.stringify(sparseAlignment.rows));
   if (!csvExportOk) fail.push("CSV export did not produce the expected download");
   if (!xlsxExportOk) fail.push("XLSX export did not produce the expected download");
   if (!xlsxImportOk) fail.push("browser XLSX import or multi-sheet selection failed");

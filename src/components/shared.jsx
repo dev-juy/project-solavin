@@ -239,7 +239,7 @@ export function RawDataViewer(p) {
         </div>
       )}
       <div ref={scrollRef} onScroll={(e) => { const st = e.currentTarget.scrollTop; setScrollTop((prev) => (Math.abs(prev - st) >= ROW_H ? st : prev)); }} style={{ maxHeight: 220, overflow: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10 }}>
+        <table aria-label="Raw I-V measurements" style={{ width: "100%", borderCollapse: "collapse", fontSize: 10 }}>
           <thead style={{ position: "sticky", top: 0, background: t.card, zIndex: 2 }}><tr>{allCols.map((h, i) => { const isSearched = h === (searchCol === "voltage" ? "voltage" : searchCol); return <th key={i} style={{ padding: "6px 8px", textAlign: i === 0 ? "left" : "right", color: isSearched ? t.accent : t.textM, fontSize: 8, textTransform: "uppercase", letterSpacing: ".04em", borderBottom: "2px solid " + (isSearched ? t.accent : t.border), fontWeight: 600, whiteSpace: "nowrap" }}>{i === 0 ? "V (V)" : h}</th>; })}</tr></thead>
           <tbody>{(() => {
             // Virtual window: render only ~15 visible rows plus overscan;
