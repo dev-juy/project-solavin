@@ -69,8 +69,9 @@ try {
   const closeWelcome = page.getByRole("button", { name: "Start analysing" });
   if (await closeWelcome.count()) await closeWelcome.first().click();
   await page.waitForTimeout(400);
-  const dismiss = page.getByRole("button", { name: "Dismiss" });
-  if (await dismiss.count()) await dismiss.first().click();
+  const dismissTour = page.getByRole("button", { name: "Dismiss guided tour", exact: true });
+  await dismissTour.click();
+  await dismissTour.waitFor({ state: "detached" });
 
   // Visit every visualization tab (including the synced dual view).
   await page.getByRole("button", { name: "Visualizations", exact: true }).click();
